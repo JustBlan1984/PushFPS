@@ -7,7 +7,8 @@ env:
   UPSTREAM_REPO: Likely7/Veyra-NRVideo
   UPSTREAM_TAG: v2.1.9
   VCPKG_COMMIT: 30ef65cad98f08e7197c9a1656fbd871bcb72f2d   # builtin-baseline in vcpkg.json: FFmpeg 9.0.1
-  DLSS_TAG: v310.7.0
+  DLSS_TAG: v310.9.16
+  DLSS_COMMIT: 9981c6350dc58c0ce21f024fd65e31e851c31689
   NVCODEC_TAG: n13.0.19.0
   CUDART_ZIP: https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.9.79-archive.zip
   XESS_TAG: v3.0.2
@@ -88,8 +89,10 @@ jobs:
         shell: bash
         run: |
           GIT_LFS_SKIP_SMUDGE=1 git clone -q --depth 1 --branch "$DLSS_TAG" --filter=blob:none --sparse https://github.com/NVIDIA/DLSS.git dlss
-          git -C dlss sparse-checkout set include lib/Windows_x86_64/x64
+          git -C dlss sparse-checkout set include lib/Windows_x86_64/x64 lib/Windows_x86_64/rel
           test -f dlss/include/nvsdk_ngx.h && test -f dlss/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib
+          test "$(git -C dlss rev-parse HEAD)" = "$DLSS_COMMIT"
+          git -C dlss lfs pull --include="lib/Windows_x86_64/rel/*"
 
       - name: NVENC headers, CUDA driver header, XeSS, FidelityFX
         working-directory: D:\deps
@@ -377,16 +380,16 @@ jobs:
           # The licences of the SDK code built into PushFPS.exe travel with it (licenses\sdk in the zip).
           $sdk = 'licenses\sdk'
           New-Item -ItemType Directory -Force $sdk | Out-Null
-          Copy-Item "$env:DEPS\dlss\LICENSE.txt" "$sdk\NVIDIA_RTX_SDKs_LICENSE_DLSS_310.7.0.txt"
+          Copy-Item "$env:DEPS\dlss\LICENSE.txt" "$sdk\NVIDIA_RTX_SDKs_LICENSE_DLSS_310.9.16.txt"
           $ffx = Get-ChildItem "$env:DEPS\ffx1" -Recurse -File -Filter 'LICENSE*' | Select-Object -First 1
           if ($ffx) { Copy-Item $ffx.FullName "$sdk\AMD_FidelityFX_SDK_1.1.4_LICENSE.txt" }
           $xess = Get-ChildItem "$env:DEPS\xess" -Recurse -File | Where-Object Name -match '^(LICENSE|license)' | Select-Object -First 1
           if ($xess) { Copy-Item $xess.FullName "$sdk\Intel_XeSS_SDK_3.0.2_LICENSE$($xess.Extension)" }
           Get-ChildItem $sdk | Format-Table Name, Length
-          if (-not (Test-Path "$sdk\NVIDIA_RTX_SDKs_LICENSE_DLSS_310.7.0.txt")) { throw 'DLSS SDK licence missing' }
+          if (-not (Test-Path "$sdk\NVIDIA_RTX_SDKs_LICENSE_DLSS_310.9.16.txt")) { throw 'DLSS SDK licence missing' }
           ./packaging/make-release.ps1 -BuildDir $env:BUILD -Version $env:PUSHFPS_VERSION `
             -UpstreamRepo $env:UPSTREAM_REPO -UpstreamTag $env:UPSTREAM_TAG -UpstreamSums upstream-sha256.txt -OutDir dist `
-            -PushFlowDir "$env:DEPS\pushflow\runtime\pushflow"
+            -PushFlowDir "$env:DEPS\pushflow\runtime\pushflow" -DlssRuntimeDir "$env:DEPS\dlss\lib\Windows_x86_64\rel"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-ChildItem dist | Format-Table Name, Length
 
@@ -399,6 +402,11 @@ jobs:
           & D:\pf-zip\Install-PushFPS.ps1 -Gpu NVIDIA -InstallDir D:\pf-install -NoShortcuts -NoLaunch -ExperimentalExtras No
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Test-Path D:\pf-install\PushFPS.exe)) { throw "PushFPS.exe missing after install" }
+          foreach ($dll in 'nvngx_dlss.dll', 'nvngx_dlssg.dll', 'nvngx_dlssd.dll') {
+            $installed = Get-Item (Join-Path 'D:\pf-install\runtime\experimental' $dll)
+            if (($installed.VersionInfo.FileVersion -replace '[, ]', '.') -ne '310.9.16.0') { throw "Wrong DLSS runtime version: $dll" }
+          }
+          if (-not (Test-Path 'D:\pf-install\dlss-sdk-manifest.json')) { throw 'DLSS SDK manifest missing' }
           # The virtual camera's files are copied apart from the rest (Install-PushFPS.ps1): they have to arrive.
           foreach ($f in @(Get-ChildItem D:\pf-zip\PushFPS-files\virtualcam -File -ErrorAction SilentlyContinue)) {
             if (-not (Test-Path (Join-Path D:\pf-install\virtualcam $f.Name))) { throw "the virtual camera file $($f.Name) was not installed" }
