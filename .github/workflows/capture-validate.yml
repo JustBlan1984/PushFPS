@@ -66,7 +66,6 @@ jobs:
 
         '
     - name: Install test (download Veyra runtime, add PushFPS, start it)
-      if: ${{ !cancelled() && steps.buildexe.outcome == 'success' }}
       timeout-minutes: 30
       run: "$packages = @(Get-ChildItem -LiteralPath dist -Filter 'PushFPS-*.zip')\nif ($packages.Count -ne 1) { throw 'Expected\
         \ exactly one PushFPS release ZIP' }\n$zip = $packages[0].FullName\nExpand-Archive $zip -DestinationPath D:\\pf-zip\n\
