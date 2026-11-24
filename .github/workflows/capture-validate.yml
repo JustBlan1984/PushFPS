@@ -1,0 +1,190 @@
+name: Validate capture DLSS update
+'on': workflow_dispatch
+permissions:
+  contents: read
+  actions: read
+jobs:
+  validate:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PUSHFPS_VERSION: 4.4.0
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        repository: DosukaSOL/PushFPS
+        ref: efb7dde99dd65e5232591b6ea3dd52859ba11497
+        path: engine
+        persist-credentials: false
+    - uses: actions/checkout@v4
+      with:
+        path: patch
+        persist-credentials: false
+    - uses: actions/download-artifact@v4
+      with:
+        name: PushFPS-Capture-Only-4.4.0
+        run-id: 45292609116
+        github-token: ${{ github.token }}
+        path: dist
+    - name: Repackage existing compiled application with corrected ZIP name
+      run: '$ErrorActionPreference = ''Stop''
+
+        $archives = @(Get-ChildItem -LiteralPath dist -Filter ''*.zip'')
+
+        if ($archives.Count -ne 1) { throw ''Expected one compiled package artifact'' }
+
+        Expand-Archive $archives[0].FullName -DestinationPath D:\previous-package
+
+        Expand-Archive patch/.github/workflows/capture-only-source.zip -DestinationPath engine -Force
+
+        Copy-Item D:\previous-package\PushFPS-files\licenses\* engine/licenses -Recurse -Force
+
+        New-Item -ItemType Directory -Force D:\repacked | Out-Null
+
+        gh release download v2.1.9 -R Likely7/Veyra-NRVideo -p SHA256SUMS.txt -O D:\upstream-sha256.txt
+
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+        ./engine/packaging/make-release.ps1 -BuildDir D:\previous-package\PushFPS-files -Version 4.4.0 -UpstreamRepo Likely7/Veyra-NRVideo
+        -UpstreamTag v2.1.9 -UpstreamSums D:\upstream-sha256.txt -OutDir D:\repacked -PushFlowDir D:\previous-package\PushFPS-files\runtime\experimental\pushflow
+        -DlssRuntimeDir D:\previous-package\PushFPS-files\runtime\experimental
+
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+        $packages = @(Get-ChildItem -LiteralPath D:\repacked -Filter ''PushFPS-*.zip'')
+
+        if ($packages.Count -ne 1 -or $packages[0].Name -ne ''PushFPS-4.4.0-win64.zip'') { throw ''Release ZIP name regression''
+        }
+
+        Move-Item $archives[0].FullName D:\previous-package\original-artifact.zip
+
+        Get-ChildItem D:\repacked -File | Copy-Item -Destination dist -Force
+
+        '
+    - name: Install test (download Veyra runtime, add PushFPS, start it)
+      if: ${{ !cancelled() && steps.buildexe.outcome == 'success' }}
+      timeout-minutes: 30
+      run: "$packages = @(Get-ChildItem -LiteralPath dist -Filter 'PushFPS-*.zip')\nif ($packages.Count -ne 1) { throw 'Expected\
+        \ exactly one PushFPS release ZIP' }\n$zip = $packages[0].FullName\nExpand-Archive $zip -DestinationPath D:\\pf-zip\n\
+        & D:\\pf-zip\\Install-PushFPS.ps1 -Gpu NVIDIA -InstallDir D:\\pf-install -NoShortcuts -NoLaunch -ExperimentalExtras\
+        \ No\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\nif (-not (Test-Path D:\\pf-install\\PushFPS.exe)) { throw \"\
+        PushFPS.exe missing after install\" }\nforeach ($dll in 'nvngx_dlss.dll', 'nvngx_dlssg.dll', 'nvngx_dlssd.dll') {\n\
+        \  $installed = Get-Item (Join-Path 'D:\\pf-install\\runtime\\experimental' $dll)\n  if (($installed.VersionInfo.FileVersion\
+        \ -replace '[, ]', '.') -ne '310.9.16.0') { throw \"Wrong DLSS runtime version: $dll\" }\n}\nif (-not (Test-Path 'D:\\\
+        pf-install\\dlss-sdk-manifest.json')) { throw 'DLSS SDK manifest missing' }\n# The virtual camera's files are copied\
+        \ apart from the rest (Install-PushFPS.ps1): they have to arrive.\nforeach ($f in @(Get-ChildItem D:\\pf-zip\\PushFPS-files\\\
+        virtualcam -File -ErrorAction SilentlyContinue)) {\n  if (-not (Test-Path (Join-Path D:\\pf-install\\virtualcam $f.Name)))\
+        \ { throw \"the virtual camera file $($f.Name) was not installed\" }\n}\n# Licensing check: every installed file that\
+        \ says it is from NVIDIA is an NVIDIA-signed original.\n$bad = Get-ChildItem D:\\pf-install -Recurse -File -Include\
+        \ *.dll, *.exe | Where-Object { $_.VersionInfo.CompanyName -match 'NVIDIA' } |\n  Where-Object { $sig = Get-AuthenticodeSignature\
+        \ $_.FullName; -not ($sig.Status -eq 'Valid' -and $sig.SignerCertificate.Subject -match 'NVIDIA') }\nif ($bad) { $bad\
+        \ | ForEach-Object { Write-Host \"::error::not an NVIDIA-signed original: $($_.FullName)\" }; throw 'modified NVIDIA\
+        \ files were installed' }\nGet-Content D:\\pf-install\\PushFPS-VERSION.txt | Out-Host\n# AMD package: installs, and\
+        \ carries no NVIDIA AI-enhancement runtime (licensed for NVIDIA graphics only).\n& D:\\pf-zip\\Install-PushFPS.ps1\
+        \ -Gpu AMD -InstallDir D:\\pf-install-amd -NoShortcuts -NoLaunch -ExperimentalExtras No\nif ($LASTEXITCODE -ne 0)\
+        \ { throw \"AMD install exit $LASTEXITCODE\" }\nif (-not (Test-Path D:\\pf-install-amd\\PushFPS.exe)) { throw 'PushFPS.exe\
+        \ missing after the AMD install' }\nforeach ($d in 'runtime\\amd-nr-rdna3', 'runtime\\amd-nr') { if (Test-Path \"\
+        D:\\pf-install-amd\\$d\") { throw \"AMD install still has $d\" } }\n$nv = Get-ChildItem D:\\pf-install-amd -Recurse\
+        \ -File -Include *.dll, *.exe | Where-Object { $_.VersionInfo.CompanyName -match 'NVIDIA' } |\n  Where-Object { $sig\
+        \ = Get-AuthenticodeSignature $_.FullName; -not ($sig.Status -eq 'Valid' -and $sig.SignerCertificate.Subject -match\
+        \ 'NVIDIA') }\nif ($nv) { throw 'AMD install has modified NVIDIA files' }\nGet-Content D:\\pf-install-amd\\PushFPS-VERSION.txt\
+        \ | Out-Host\n# Nothing is lost: with -ExperimentalExtras Yes the AMD extras are installed (cached download, no new\
+        \ fetch).\n& D:\\pf-zip\\Install-PushFPS.ps1 -Gpu AMD -InstallDir D:\\pf-install-amd -NoShortcuts -NoLaunch -ExperimentalExtras\
+        \ Yes\nif ($LASTEXITCODE -ne 0) { throw \"AMD install with extras exit $LASTEXITCODE\" }\nif (-not (Test-Path D:\\\
+        pf-install-amd\\runtime\\amd-nr)) { throw 'opt-in extras were not installed' }\nRemove-Item D:\\pf-install-amd -Recurse\
+        \ -Force\n& D:\\pf-zip\\Install-PushFPS.ps1 -Gpu NVIDIA -InstallDir D:\\pf-install-nvx -NoShortcuts -NoLaunch -ExperimentalExtras\
+        \ Yes\nif ($LASTEXITCODE -ne 0) { throw \"NVIDIA install with extras exit $LASTEXITCODE\" }\nif (-not (Test-Path D:\\\
+        pf-install-nvx\\runtime\\experimental\\nr-ampere\\nvngx_dlssnr.dll)) { throw 'opt-in RTX 30 extra was not installed'\
+        \ }\nRemove-Item D:\\pf-install-nvx -Recurse -Force\nWrite-Host 'Default installs carry only licensed files; the experimental\
+        \ extras install on request.' \n# Start it and make sure Windows resolves every DLL and the program reaches its QML\
+        \ session.\n$p = Start-Process -WindowStyle Hidden D:\\pf-install\\PushFPS.exe -PassThru\nStart-Sleep -Seconds 25\n\
+        $alive = -not $p.HasExited\nif (-not $alive) { Write-Host \"exit code: $($p.ExitCode)\" }\nGet-ChildItem D:\\pf-install\\\
+        logs -ErrorAction SilentlyContinue | ForEach-Object { \"=== $($_.Name)\"; Get-Content $_.FullName -Tail 60 }\nif ($alive)\
+        \ { Stop-Process -Id $p.Id -Force }\n$log = Get-ChildItem D:\\pf-install\\logs -Filter *.log -ErrorAction SilentlyContinue\
+        \ | Get-Content -Raw\nif ($log -notmatch 'PushFPS QML session started') { throw \"PushFPS did not reach its QML session\
+        \ (no GPU on this runner is fine; a missing DLL or entry point is not)\" }\n$qmlErrors = @(($log -split \"`n\") |\
+        \ Where-Object { $_ -match '\\[ERROR\\] \\[qml\\]' })\nif ($qmlErrors.Count) { $qmlErrors | ForEach-Object { Write-Host\
+        \ \"::error::$_\" }; throw \"The interface logged QML errors at startup\" }\nWrite-Host \"PushFPS started and loaded\
+        \ its interface with no QML errors.\"\n# Every main page and the capture dialog, each in a fresh profile: no QML errors\
+        \ either.\n$pages = @(@('--page', 'pro', '--tab', 'fg'), @('--page', 'pro', '--tab', 'quality'), @('--page', 'pro',\
+        \ '--tab', 'display'),\n           @('--page', 'set'), @('--page', 'min'), @('--page', 'exp'), @('--page', 'live'),\
+        \ @('--page', 'watch'), @('--page', 'home', '--dialog', 'capture'))\n$i = 0\nforeach ($pa in $pages) {\n  $i++\n \
+        \ $env:VEYRA_LOG_FILE = \"D:\\pf-pages\\page-$i.log\"\n  New-Item -ItemType Directory -Force D:\\pf-pages | Out-Null\n\
+        \  $q = Start-Process -WindowStyle Hidden D:\\pf-install\\PushFPS.exe -PassThru -ArgumentList ($pa + @('--data-dir',\
+        \ \"D:\\pf-pages\\data-$i\", '--exit-after', '12000'))\n  if (-not $q.WaitForExit(40000)) { Stop-Process -Id $q.Id\
+        \ -Force }\n  $plog = Get-Content \"D:\\pf-pages\\page-$i.log\" -Raw -ErrorAction SilentlyContinue\n  if ($plog -notmatch\
+        \ 'PushFPS QML session started') { throw \"$($pa -join ' '): no QML session\" }\n  $errs = @(($plog -split \"`n\"\
+        ) | Where-Object { $_ -match '\\[ERROR\\] \\[qml\\]' })\n  if ($errs.Count) { $errs | ForEach-Object { Write-Host\
+        \ \"::error::$($pa -join ' '): $_\" }; throw \"QML errors on $($pa -join ' ')\" }\n  Write-Host \"$($pa -join ' '):\
+        \ no QML errors\"\n}\nRemove-Item Env:VEYRA_LOG_FILE\n# The in-app update path, with the same tools and arguments\
+        \ PushFPS uses (UpdateChecker.cpp\n# unpackAndLaunch): Windows' tar unpacks the release zip, then the installer from\
+        \ that folder\n# installs over the running copy's folder and waits for the old process. Only the download\n# and signature\
+        \ check are left out here (unit-tested in UpdateVerifyTests).\n$old = Start-Process -WindowStyle Hidden D:\\pf-install\\\
+        PushFPS.exe -PassThru -ArgumentList @('--data-dir', 'D:\\pf-pages\\data-update', '--exit-after', '8000')\nNew-Item\
+        \ -ItemType Directory -Force D:\\pf-update\\files | Out-Null\n& \"$env:SystemRoot\\System32\\tar.exe\" -xf $zip -C\
+        \ D:\\pf-update\\files\nif ($LASTEXITCODE -ne 0) { throw \"tar could not unpack the release zip (exit $LASTEXITCODE)\"\
+        \ }\nif (-not (Test-Path D:\\pf-update\\files\\Install-PushFPS.ps1)) { throw 'the installer is not at the top of the\
+        \ release zip' }\nSet-Content D:\\pf-install\\PushFPS-update-marker.txt 'kept'\nSet-Content D:\\pf-update\\empty.txt\
+        \ ''\n# The virtual camera's file as it is while another program has it loaded: it cannot be written over, it\n# can\
+        \ be renamed. Until 23 November 2026 that ended an install with \"Copying files failed\" and left the\n# folder half\
+        \ old and half new (the owner's PC, with a browser open). The install must finish, with the\n# new file under the\
+        \ old name and the old one moved aside.\n$cam = 'D:\\pf-install\\virtualcam\\pushfps-virtualcam64.dll'; $camHeld =\
+        \ $null\nif (Test-Path $cam) { $camHeld = [System.IO.File]::Open($cam, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,\
+        \ [System.IO.FileShare]'Read, Delete') }\n$u = Start-Process -WindowStyle Hidden powershell.exe -PassThru -Wait -RedirectStandardInput\
+        \ D:\\pf-update\\empty.txt -RedirectStandardOutput D:\\pf-update\\out.txt -ArgumentList @('-NoProfile', '-ExecutionPolicy',\
+        \ 'Bypass', '-File', 'D:\\pf-update\\files\\Install-PushFPS.ps1',\n  '-Gpu', 'NVIDIA', '-InstallDir', 'D:\\pf-install',\
+        \ '-NoShortcuts', '-ExperimentalExtras', 'No', '-WaitForPid', \"$($old.Id)\", '-NoLaunch')\nGet-Content D:\\pf-update\\\
+        out.txt -ErrorAction SilentlyContinue | Out-Host\nif ($u.ExitCode -ne 0) { throw \"the update install failed (exit\
+        \ $($u.ExitCode))\" }\nif (-not $old.HasExited) { throw 'the installer did not wait for the running PushFPS' }\nif\
+        \ (-not (Test-Path D:\\pf-install\\PushFPS-update-marker.txt)) { throw 'the update removed a file it should have kept'\
+        \ }\nif ((Get-Content D:\\pf-install\\PushFPS-VERSION.txt -Raw) -notmatch \"PushFPS $([regex]::Escape($env:PUSHFPS_VERSION))\"\
+        ) { throw 'PushFPS-VERSION.txt does not name this version after the update' }\nif ($camHeld) {\n  $camHeld.Dispose()\n\
+        \  if (@(Get-ChildItem D:\\pf-install\\virtualcam -Filter 'pushfps-virtualcam64.dll.replaced-*').Count -ne 1) { throw\
+        \ 'the virtual camera file that another program held was not moved aside' }\n  if ((Get-FileHash $cam -Algorithm SHA256).Hash\
+        \ -ne (Get-FileHash D:\\pf-update\\files\\PushFPS-files\\virtualcam\\pushfps-virtualcam64.dll -Algorithm SHA256).Hash)\
+        \ { throw 'the virtual camera file was not replaced while another program held it' }\n  Write-Host 'Update path: a\
+        \ virtual camera file held by another program is moved aside and replaced; the install finishes.'\n} else { Write-Host\
+        \ '::warning::no virtual camera file in this package: the held-file path of the installer was not run' }\nWrite-Host\
+        \ 'Update path: tar unpack, install over the old copy while it closes, version record written.'\n# A build that is\
+        \ not a release never installs over the PushFPS that is there (Install-PushFPS.ps1,\n# $OwnFolder; 23 November 2026:\
+        \ a private test build, double-clicked, replaced the owner's own PushFPS).\n# Run the way a double click runs it,\
+        \ with no folder named: its own folder, its own shortcuts, a copy of\n# the settings, and the installed PushFPS's\
+        \ folder exactly as it was. A release build keeps the default.\nif ($env:PUSHFPS_VERSION -notmatch '^\\d+\\.\\d+\\\
+        .\\d+$') {\n  $main = \"$env:LOCALAPPDATA\\Programs\\PushFPS\"; $own = \"$env:LOCALAPPDATA\\Programs\\PushFPS-test\"\
+        \n  if ((Test-Path $main) -or (Test-Path $own)) { throw 'the runner already has a PushFPS folder: this test would\
+        \ not be its own' }\n  $desk = [Environment]::GetFolderPath('Desktop'); $menu = [Environment]::GetFolderPath('Programs')\n\
+        \  New-Item -ItemType Directory -Force $desk, $menu, \"$main\\runtime_local\\user-data-2.0.0\" | Out-Null\n  Set-Content\
+        \ \"$main\\runtime_local\\user-data-2.0.0\\ci-settings.txt\" 'from the installed PushFPS'\n  Set-Content \"$main\\\
+        ci-main.txt\" 'the installed PushFPS'\n  & D:\\pf-zip\\Install-PushFPS.ps1 -Gpu NVIDIA -NoLaunch -ExperimentalExtras\
+        \ No\n  if ($LASTEXITCODE -ne 0) { throw \"a test build's install into its own folder failed (exit $LASTEXITCODE)\"\
+        \ }\n  if (-not (Test-Path \"$own\\PushFPS.exe\")) { throw 'a test build did not install into its own folder' }\n\
+        \  $mainFiles = @(Get-ChildItem $main -Recurse -File | ForEach-Object { $_.FullName.Substring($main.Length) } | Sort-Object)\n\
+        \  if (($mainFiles -join '|') -ne '\\ci-main.txt|\\runtime_local\\user-data-2.0.0\\ci-settings.txt') { throw \"a test\
+        \ build changed the folder of the installed PushFPS: $($mainFiles -join ', ')\" }\n  if ((Get-Content \"$own\\runtime_local\\\
+        user-data-2.0.0\\ci-settings.txt\" -Raw) -notmatch 'from the installed PushFPS') { throw 'a test build did not take\
+        \ a copy of the settings' }\n  foreach ($folder in $desk, $menu) {\n    if (Test-Path (Join-Path $folder 'PushFPS.lnk'))\
+        \ { throw \"a test build wrote the installed PushFPS's shortcut in $folder\" }\n    if (-not (Test-Path (Join-Path\
+        \ $folder 'PushFPS test.lnk'))) { throw \"a test build has no shortcut of its own in $folder\" }\n  }\n  # Installed\
+        \ again: the settings it has by then are its own and stay.\n  Set-Content \"$own\\runtime_local\\user-data-2.0.0\\\
+        ci-settings.txt\" 'changed in the test build'\n  Set-Content \"$main\\runtime_local\\user-data-2.0.0\\ci-settings.txt\"\
+        \ 'changed in the installed PushFPS'\n  & D:\\pf-zip\\Install-PushFPS.ps1 -Gpu NVIDIA -NoShortcuts -NoLaunch -ExperimentalExtras\
+        \ No\n  if ($LASTEXITCODE -ne 0) { throw \"a test build's second install failed (exit $LASTEXITCODE)\" }\n  if ((Get-Content\
+        \ \"$own\\runtime_local\\user-data-2.0.0\\ci-settings.txt\" -Raw) -notmatch 'changed in the test build') { throw 'a\
+        \ second install replaced the test build''s own settings' }\n  & D:\\pf-zip\\Install-PushFPS.ps1 -Uninstall\n  if\
+        \ ($LASTEXITCODE -ne 0) { throw \"a test build's uninstall failed (exit $LASTEXITCODE)\" }\n  if (Test-Path $own)\
+        \ { throw 'the uninstall left the test build''s folder' }\n  if (-not (Test-Path \"$main\\ci-main.txt\")) { throw\
+        \ 'a test build''s uninstall removed the installed PushFPS' }\n  foreach ($folder in $desk, $menu) { if (Test-Path\
+        \ (Join-Path $folder 'PushFPS test.lnk')) { throw \"the uninstall left a shortcut in $folder\" } }\n  Remove-Item\
+        \ $main -Recurse -Force\n  Write-Host 'Test build: its own folder and shortcuts, a copy of the settings once, the\
+        \ installed PushFPS untouched; uninstall removes only itself.'\n}\n"
+    - uses: actions/upload-artifact@v4
+      with:
+        name: PushFPS-Capture-Only-4.4.0-Validated
+        path: 'D:\repacked\*.zip
+
+          D:\repacked\*.sha256'
+        if-no-files-found: error

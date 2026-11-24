@@ -397,7 +397,9 @@ jobs:
         if: ${{ !cancelled() && steps.buildexe.outcome == 'success' }}
         timeout-minutes: 30
         run: |
-          $zip = (Get-ChildItem dist/PushFPS-*.zip)[0].FullName
+          $packages = @(Get-ChildItem -LiteralPath dist -Filter 'PushFPS-*.zip')
+          if ($packages.Count -ne 1) { throw 'Expected exactly one PushFPS release ZIP' }
+          $zip = $packages[0].FullName
           Expand-Archive $zip -DestinationPath D:\pf-zip
           & D:\pf-zip\Install-PushFPS.ps1 -Gpu NVIDIA -InstallDir D:\pf-install -NoShortcuts -NoLaunch -ExperimentalExtras No
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
