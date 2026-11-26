@@ -2,7 +2,7 @@
 param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Optimized,
-    [switch]$RayTracing
+    [switch]$RayTracing=$true
 )
 $ErrorActionPreference='Stop'
 $exePath=(Resolve-Path -LiteralPath $Exe).Path

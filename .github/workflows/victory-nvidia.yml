@@ -56,7 +56,7 @@ jobs:
         run: |
           $targets = rustc --print target-cpus
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $cpu = @('raptorlake','alderlake','x86-64-v3') | Where-Object { $name=$_; $targets -match "^\s*$name\s" } | Select-Object -First 1
+          $cpu = @('raptorlake','alderlake','x86-64-v3') | Where-Object { $name=$_; $targets -match "^\s*$name(?:\s|$)" } | Select-Object -First 1
           if (-not $cpu) { throw 'No supported Intel/AVX2 CPU code-generation target found' }
           "RUSTFLAGS=-C target-cpu=$cpu" | Out-File -Append $env:GITHUB_ENV
           "VICTORY_CPU_TARGET=$cpu" | Out-File -Append $env:GITHUB_ENV

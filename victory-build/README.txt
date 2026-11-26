@@ -11,9 +11,9 @@ First start:
 - Keep the supplied game executable beside the matching game archives and console DLLs.
 - Set VICTORY_CONFIG to a local config file whose cache/data paths are OUTSIDE the source checkout.
 - Run Start-VIctory-NVIDIA.ps1 -Exe <path to game_scarlett_master.exe>.
-- Default is the upstream Safe launch with RTX 5070 Ti selected, 1080p output, experimental wide waves off, AMD numeric mode off and ray tracing off.
+- Default is the upstream Safe launch with RTX 5070 Ti selected, 1080p output, experimental wide waves off, AMD numeric mode off and ray tracing ON.
 - -Optimized selects the upstream faster launch profile after the baseline boots.
-- -RayTracing is an optional later comparison. No FSR 4-only or AMD vendor path is forced.
+- Ray tracing is enabled by default through the upstream BVH builder; local NVIDIA compatibility remains to be tested. No FSR 4-only or AMD vendor path is forced.
 - All environment changes apply to the launched process, not persistent user/system environment.
 - Run non-administratively. Saves and diagnostics belong in the configured local data directory.
 - Inspect/configuration/shader translation must succeed before treating a game boot as verified.
