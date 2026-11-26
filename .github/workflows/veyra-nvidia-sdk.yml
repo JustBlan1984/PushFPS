@@ -1,0 +1,422 @@
+# Builds the complete upstream Veyra 2.2.1 application with current NVIDIA SDKs.
+# The existing installation supplies unchanged vendor runtimes; updated DLSS DLLs
+# download directly from NVIDIA during installation. No SDK headers or DLLs are published.
+name: Veyra 2.2.1 NVIDIA SDK update
+
+on:
+  push:
+    branches: ['veyra/2.2.1-nvidia-sdk']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One build at a time per branch and trigger: a second push waits and then reuses the FFmpeg cache.
+# Release dispatches get their own group, so a release never cancels (or is cancelled by) the push
+# build of the same commit; GitHub cancels an older *pending* run when a newer one queues in the same
+# group, and a cancelled push run makes the README build badge read "failing".
+concurrency:
+  group: veyra-nvidia-sdk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: 2
+  VCPKG_MAX_CONCURRENCY: 2
+  UPSTREAM_REPO: Likely7/Veyra-NRVideo
+  # The runtime package (Qt, FFmpeg, the vendors' runtimes) the installer downloads. 2.2.1's has the same
+  # vendor runtimes as 2.1.9's (upstream-inspect, 24 November 2026: every file under runtime\ has the same
+  # name and size) and FFmpeg 9.0.1 rebuilt with FFmpeg's fix for the d3d12va reference-only surface pool
+  # (bcd2c69e087a: PS5 hardware decoding stopped after about 71 frames on cards such as the RX 9070 XT).
+  # Its program sits under versions\2.2.1\; the installer finds the runtime by the program's folder.
+  UPSTREAM_TAG: v2.2.1
+  VCPKG_COMMIT: 30ef65cad98f08e7197c9a1656fbd871bcb72f2d   # builtin-baseline in vcpkg.json: FFmpeg 9.0.1
+  DLSS_TAG: v310.9.16
+  NVCODEC_TAG: n13.1.15.0
+  CUDART_ZIP: https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.9.79-archive.zip
+  XESS_TAG: v3.0.2
+  FFX1_TAG: v1.1.4
+  FFX2_TAG: v2.3.0
+  AMF_COMMIT: 57ee0cfb0e1a08d9041f77435653794c1b012be0   # AMD AMF SDK v1.5.3 (MIT headers only; runtime = AMD driver)
+  # Streaming sources (PS5 Remote Play, Moonlight, Xbox), as Veyra builds them: pinned sources,
+  # verified by scripts/remoteplay/verify-chiaki-stage.py and scripts/moonlight/verify-moonlight-stage.py.
+  CHIAKI_COMMIT: 0e16950165f06e5c3291537c2eeba6e852be7120
+  MOONLIGHT_COMMIT: f900dd4767759c7b9d0e93bcea666b55c69ea62f
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: veyra-src
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DEPS: D:\deps
+      BUILD: D:\b
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: _update
+      - uses: actions/checkout@v4
+        with:
+          repository: Likely7/Veyra-NRVideo
+          ref: b9cc86aa9f68462ea740afe6104db4d5ce227aeb
+          persist-credentials: false
+          path: veyra-src
+
+      # A release tag (v2.1.5) builds exactly that version; every other build is 2.1.5-pushfps.<run>.
+      - name: Version and source identity
+        run: |
+          "VEYRA_BUILD_VERSION=2.2.1-nvidia-sdk.$env:GITHUB_RUN_NUMBER" | Out-File -Append $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force $env:DEPS | Out-Null
+          git rev-parse HEAD
+          git status --short
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Qt 6.8.3 (MSVC 2022 x64)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          dir: D:\
+          cache: true
+
+      - name: NVIDIA DLSS SDK ${{ env.DLSS_TAG }} (headers + static NGX library)
+        working-directory: D:\deps
+        shell: bash
+        run: |
+          GIT_LFS_SKIP_SMUDGE=1 git clone -q --depth 1 --branch "$DLSS_TAG" --filter=blob:none --sparse https://github.com/NVIDIA/DLSS.git dlss
+          git -C dlss sparse-checkout set include lib/Windows_x86_64/x64
+          test "$(git -C dlss rev-parse HEAD)" = "9981c6350dc58c0ce21f024fd65e31e851c31689"
+          test -f dlss/include/nvsdk_ngx.h && test -f dlss/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib
+
+      - name: NVENC headers, CUDA driver header, XeSS, FidelityFX
+        working-directory: D:\deps
+        shell: bash
+        run: |
+          set -e
+          git clone -q --depth 1 --branch "$NVCODEC_TAG" https://github.com/FFmpeg/nv-codec-headers.git nv-codec-headers
+          curl -sSfL "$CUDART_ZIP" -o cudart.zip && unzip -q cudart.zip -d cudart && mv cudart/*/ cudart-root
+          test -f cudart-root/include/cuda.h
+          gh release download "$XESS_TAG" -R intel/xess -p '*.zip' -O xess.zip && unzip -q xess.zip -d xess
+          find xess -name xefg_swapchain_d3d12.h | head -1
+          GIT_LFS_SKIP_SMUDGE=1 git clone -q --depth 1 --branch "$FFX2_TAG" --filter=blob:none --sparse https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git ffx2
+          git -C ffx2 sparse-checkout set Kits/FidelityFX/api/include Kits/FidelityFX/framegeneration/include Kits/FidelityFX/upscalers/include
+          gh release download "$FFX1_TAG" -R GPUOpen-LibrariesAndSDKs/FidelityFX-SDK -p '*.zip' -O ffx1.zip && unzip -q ffx1.zip -d ffx1
+          # AMD AMF SDK public headers (MIT), for AMD FRC frame generation (Veyra 2.1.9). Only the headers:
+          # the AMF runtime (amfrt64.dll) comes with the user's AMD driver and is never shipped.
+          git init -q amf && git -C amf remote add origin https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git
+          git -C amf fetch -q --depth 1 --filter=blob:none origin "$AMF_COMMIT"
+          git -C amf sparse-checkout set amf/public/include && git -C amf checkout -q FETCH_HEAD
+          test -f amf/amf/public/include/components/FRC.h
+
+      # FidelityFX 1.1.4 ships source only. Build the optical flow + DX12 backend static libraries with the
+      # static C runtime (/MT), as PushFPS links it; they land in sdk/bin/ffx_sdk where CMakeLists.txt looks.
+      - name: Build FidelityFX 1.1.4 optical flow (static)
+        working-directory: D:\deps\ffx1\sdk
+        run: |
+          cmake -S . -B build -A x64 -DFFX_API_BACKEND=DX12_X64 -DFFX_ALL=OFF -DFFX_OF=ON -DFFX_AUTO_COMPILE_SHADERS=1 `
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --config Release --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem bin\ffx_sdk -Filter *.lib | Format-Table Name, Length
+
+      - name: Locate SDK roots
+        shell: bash
+        run: |
+          xess=$(dirname "$(dirname "$(dirname "$(find /d/deps/xess -name xefg_swapchain_d3d12.h | head -1)")")")
+          ffx1lib=$(find /d/deps/ffx1/sdk/bin -iname 'ffx_opticalflow_x64.lib' | head -1)
+          ffx1=""; [ -n "$ffx1lib" ] && ffx1=$(dirname "$(dirname "$(dirname "$ffx1lib")")")
+          {
+            echo "XESS_ROOT=$(cygpath -m "$xess")"
+            echo "FFX1_ROOT=$( [ -n "$ffx1" ] && cygpath -m "$ffx1" )"
+          } >> "$GITHUB_ENV"
+          echo "XeSS root: $xess"; echo "FidelityFX 1.x root: ${ffx1:-not found}"
+          if [ -z "$ffx1" ]; then echo "::error::FidelityFX 1.1.4 optical flow libraries not found; PushFPS needs them for optical flow"; exit 1; fi
+
+      # Restore and save are separate steps: actions/cache only saves when the whole job succeeds,
+      # and FFmpeg takes ~25 minutes to build, so it is saved as soon as it is built. vcpkg reuses a
+      # cached package only when its ABI hash (compiler included) matches, so every run saves its
+      # binary cache under a new key and restores the newest one.
+      - name: Restore vcpkg binaries
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: D:\deps\vcpkg-binary
+          key: vcpkg-bin-${{ env.VCPKG_COMMIT }}-v2-${{ github.run_id }}
+          restore-keys: vcpkg-bin-${{ env.VCPKG_COMMIT }}-v2-
+
+      - name: FFmpeg 9.0.1 (vcpkg at the pinned baseline)
+        working-directory: D:\deps
+        run: |
+          git init -q vcpkg; git -C vcpkg remote add origin https://github.com/microsoft/vcpkg.git
+          git -C vcpkg fetch -q --depth 1 origin $env:VCPKG_COMMIT; git -C vcpkg checkout -q FETCH_HEAD
+          & vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          New-Item -ItemType Directory -Force vcpkg-binary | Out-Null
+          $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:DEPS\vcpkg-binary"
+          & vcpkg\vcpkg.exe install "ffmpeg[core,avcodec,avformat,avfilter,swresample,swscale]:x64-windows" --clean-after-build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem vcpkg\installed\x64-windows\bin\av*.dll, vcpkg\installed\x64-windows\bin\sw*.dll | Format-Table Name, Length
+
+      - name: Streaming dependencies (static, for PS5 Remote Play, Moonlight and Xbox)
+        working-directory: D:\deps
+        run: |
+          $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:DEPS\vcpkg-binary"
+          # The same static tree Veyra uses (scripts/xbox/dependency-lock.json): one OpenSSL for Chiaki,
+          # Moonlight and libdatachannel; libjuice with Veyra's reviewed overlay.
+          & vcpkg\vcpkg.exe install --classic --triplet x64-windows-static "--x-install-root=$env:DEPS\stream-installed" `
+            "--overlay-ports=$env:GITHUB_WORKSPACE\veyra-src\scripts\xbox\vcpkg-overlay" `
+            openssl opus json-c libevent miniupnpc protobuf "sdl3" "libdatachannel[srtp,ws]" nlohmann-json pkgconf zlib --clean-after-build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem "$env:DEPS\stream-installed\x64-windows-static\lib" -Filter *.lib | Format-Table Name, Length
+
+      - name: Save vcpkg binaries
+        if: always() && steps.vcpkg-cache.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: D:\deps\vcpkg-binary
+          key: vcpkg-bin-${{ env.VCPKG_COMMIT }}-v2-${{ github.run_id }}
+
+      - name: Streaming sources (Chiaki-ng with Veyra's patches, moonlight-common-c)
+        working-directory: D:\deps
+        run: |
+          git config --global core.autocrlf false
+          git config --global advice.detachedHead false
+          # Chiaki-ng: a clean pinned checkout, and a worktree with the reviewed patches (0003: four of
+          # chiaki-ng's own later commits for buttons that stayed pressed, checked to be exactly those).
+          git clone -q https://github.com/streetpea/chiaki-ng.git chiaki-clean
+          git -C chiaki-clean checkout -q $env:CHIAKI_COMMIT
+          git -C chiaki-clean submodule update -q --init --recursive
+          git -C chiaki-clean worktree add -q --detach "$env:DEPS\chiaki-stage" $env:CHIAKI_COMMIT
+          git -C chiaki-stage submodule update -q --init --recursive
+          foreach ($p in '0001-chiaki-msvc-vla-compat.patch', '0002-chiaki-video-metadata.patch', '0003-chiaki-feedback-history.patch', '0004-chiaki-pad-proc-no.patch', '0005-chiaki-socket-receive-buffer.patch') {
+            git -C chiaki-stage apply "$env:GITHUB_WORKSPACE\veyra-src\scripts\remoteplay\patches\$p"
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error::$p does not apply"; exit 1 }
+          }
+          python "$env:GITHUB_WORKSPACE\veyra-src\scripts\remoteplay\verify-chiaki-stage.py" --stage "$env:DEPS\chiaki-stage" --clean "$env:DEPS\chiaki-clean"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # moonlight-common-c with its pinned ENet and nanors.
+          git clone -q https://github.com/moonlight-stream/moonlight-common-c.git moonlight-common-c
+          git -C moonlight-common-c checkout -q $env:MOONLIGHT_COMMIT
+          git -C moonlight-common-c submodule update -q --init --recursive
+          python "$env:GITHUB_WORKSPACE\veyra-src\scripts\moonlight\verify-moonlight-stage.py" --source "$env:DEPS\moonlight-common-c" --lock "$env:GITHUB_WORKSPACE\veyra-src\scripts\moonlight\dependency-lock.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Chiaki's protocol buffers are generated by nanopb's Python generator, which also runs protoc
+          # (from the static tree) to build its own descriptor module.
+          python -m pip install -q protobuf
+          "$env:DEPS\stream-installed\x64-windows-static\tools\protobuf" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      # Optional: NVIDIA Optical Flow SDK 5.0.7 interface headers (nvOpticalFlowCommon.h, nvOpticalFlowD3D12.h)
+      # from the secret NVOF_SDK_HEADERS. They stay on the runner; nothing here uploads or packages them.
+      - name: NVIDIA Optical Flow headers (optional)
+        env:
+          NVOF_SDK_HEADERS: ${{ secrets.NVOF_SDK_HEADERS }}
+        run: |
+          if (-not $env:NVOF_SDK_HEADERS) {
+            throw "NVOF_SDK_HEADERS is required to retain NVIDIA Optical Flow support."
+            exit 0
+          }
+          $root = "$env:RUNNER_TEMP\nvof-sdk"
+          $dir = "$root\NvOFInterface"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $zip = "$env:RUNNER_TEMP\nvof-headers.zip"
+          [IO.File]::WriteAllBytes($zip, [Convert]::FromBase64String(($env:NVOF_SDK_HEADERS -replace '\s', '')))
+          Expand-Archive $zip -DestinationPath $dir -Force
+          Remove-Item $zip
+          # Accept the headers at the zip's top level or inside one folder.
+          foreach ($h in 'nvOpticalFlowCommon.h', 'nvOpticalFlowD3D12.h') {
+            if (-not (Test-Path "$dir\$h")) {
+              $found = Get-ChildItem $dir -Recurse -Filter $h | Select-Object -First 1
+              if (-not $found) { Write-Host "::error::NVOF_SDK_HEADERS has no $h"; exit 1 }
+              Copy-Item $found.FullName "$dir\$h"
+            }
+          }
+          Write-Host "NVIDIA Optical Flow headers present: NVIDIA optical flow is built in"
+          "NVOF_SDK_ROOT=$root" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+
+      - name: RIFE DirectML headers
+        run: |
+          $root = "$env:DEPS\ort-dml"
+          New-Item -ItemType Directory -Force "$root\ort","$root\dml" | Out-Null
+          Invoke-WebRequest https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/1.23.0 -OutFile "$env:DEPS\ort.zip"
+          Invoke-WebRequest https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/1.15.4 -OutFile "$env:DEPS\dml.zip"
+          Expand-Archive "$env:DEPS\ort.zip" "$root\ort" -Force
+          Expand-Archive "$env:DEPS\dml.zip" "$root\dml" -Force
+          if (-not (Test-Path "$root\ort\build\native\include\dml_provider_factory.h")) { throw 'RIFE ONNX headers missing' }
+          if (-not (Test-Path "$root\dml\include\DirectML.h")) { throw 'DirectML headers missing' }
+      - name: Dolby Vision parsing library (libdovi 3.4.0, built from pinned source)
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = "$env:DEPS\dovi_tool"; $out = "$env:DEPS\libdovi"
+          git clone -q https://github.com/quietvoid/dovi_tool $src
+          git -C $src checkout -q d1abe0e27ff2c7ab3339614d06db9f8a058af6b2
+          Push-Location "$src\dolby_vision"
+          cargo rustc --release --features capi --crate-type cdylib
+          if ($LASTEXITCODE -ne 0) { throw 'libdovi did not build' }
+          cargo install cbindgen --version 0.29.4 --locked
+          if ($LASTEXITCODE -ne 0) { throw 'cbindgen did not install' }
+          New-Item -ItemType Directory -Force "$out\include\libdovi", "$out\lib", "$out\bin" | Out-Null
+          cbindgen --config cbindgen.toml --crate dolby_vision --output "$out\include\libdovi\rpu_parser.h"
+          if ($LASTEXITCODE -ne 0) { throw 'the libdovi header was not generated' }
+          Pop-Location
+          $dll = Get-ChildItem $src -Recurse -File -Filter dolby_vision.dll | Where-Object FullName -match '\\release\\' | Select-Object -First 1
+          $lib = Get-ChildItem $src -Recurse -File -Filter dolby_vision.dll.lib | Where-Object FullName -match '\\release\\' | Select-Object -First 1
+          if (-not $dll -or -not $lib) { throw 'libdovi: the built library was not found' }
+          Copy-Item $dll.FullName "$out\bin"; Copy-Item $lib.FullName "$out\lib"
+          Copy-Item (Get-ChildItem $src -File -Filter 'LICENSE*' | Select-Object -First 1).FullName "$out\LICENSE"
+          Get-ChildItem $out -Recurse -File | Format-Table FullName, Length
+          Select-String -Path "$out\include\libdovi\rpu_parser.h" -Pattern 'dovi_parse|dovi_rpu' | Select-Object -First 5
+          "LIBDOVI_ROOT=$out" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Configure
+        run: |
+          $ffmpeg = "$env:DEPS\vcpkg\installed\x64-windows"
+          $stream = "$env:DEPS\stream-installed\x64-windows-static"
+          $env:PKG_CONFIG_PATH = "$stream\lib\pkgconfig"
+          if (-not $env:LIBDOVI_ROOT) { throw 'Full Veyra requires libdovi.' }
+          $dovi = @('-DVEYRA_ENABLE_LIBDOVI=ON', "-DVEYRA_LIBDOVI_ROOT=$env:LIBDOVI_ROOT")
+          cmake -S . -B $env:BUILD -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR;$ffmpeg;$stream" `
+            -DVEYRA_BUILD_QML_UI=ON -DVEYRA_ENABLE_EXPERIMENTAL_DLSSNR=ON -DVEYRA_ENABLE_D3D12_DEBUG=OFF `
+            -DVEYRA_ENABLE_REMOTEPLAY=ON -DVEYRA_ENABLE_MOONLIGHT=ON -DVEYRA_ENABLE_XBOX=ON `
+            "-DVEYRA_RP_CHIAKI_SOURCE_DIR=$env:DEPS\chiaki-stage" "-DVEYRA_RP_CHIAKI_VERIFY_DIR=$env:DEPS\chiaki-clean" `
+            "-DVEYRA_MOONLIGHT_SOURCE_DIR=$env:DEPS\moonlight-common-c" `
+            "-DPROTOC=$stream\tools\protobuf\protoc.exe" "-DPKG_CONFIG_EXECUTABLE=$stream\tools\pkgconf\pkgconf.exe" `
+            -DOPENSSL_USE_STATIC_LIBS=ON -DOPENSSL_MSVC_STATIC_RT=ON `
+            "-DVEYRA_DISPLAY_VERSION=$env:VEYRA_BUILD_VERSION" `
+            "-DVEYRA_FFMPEG_ROOT=$ffmpeg" `
+            "-DVEYRA_DLSS_SDK_ROOT=$env:DEPS\dlss" `
+            "-DVEYRA_NVENC_HEADERS_ROOT=$env:DEPS\nv-codec-headers" `
+            "-DVEYRA_CUDA_DRIVER_INCLUDE_DIR=$env:DEPS\cudart-root\include" `
+            "-DVEYRA_XESS_ROOT=$env:XESS_ROOT" `
+            "-DVEYRA_FIDELITYFX_ROOT=$env:FFX1_ROOT" `
+            "-DVEYRA_FIDELITYFX2_ROOT=$env:DEPS\ffx2\Kits\FidelityFX" `
+            "-DVEYRA_AMF_SDK_ROOT=$env:DEPS\amf\amf\public" `
+            "-DVEYRA_NVOF_SDK_ROOT=$env:NVOF_SDK_ROOT" `
+            "-DVEYRA_ORT_DML_ROOT=$env:DEPS\ort-dml" `
+            -DVEYRA_UPDATE_PUBLIC_KEY=984321f24a445f642c368a3a0d218dff75820138766a0b8e4c1281f3b871daa2 @dovi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+
+      - name: Build Veyra with current NVIDIA SDK headers and libraries
+        timeout-minutes: 15
+        run: |
+          cmake --build $env:BUILD --target veyra_qml_ui --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Get-ChildItem $env:BUILD -Recurse -Filter veyra_qml_ui.exe | Select-Object -First 1
+          if (-not $exe) { throw 'Veyra executable missing' }
+          $exe.VersionInfo | Format-List FileVersion,ProductVersion
+          "VEYRA_BUILT_EXE=$($exe.FullName)" | Out-File -Append $env:GITHUB_ENV
+
+      - name: SDK-relevant contract and encoder checks
+        timeout-minutes: 15
+        run: |
+          $env:PATH = "$env:DEPS\vcpkg\installed\x64-windows\bin;$env:QT_ROOT_DIR\bin;$env:PATH"
+          foreach ($target in 'veyra_parity_tests','veyra_unified_tests','veyra_pipeline_tests','veyra_frame_pacing_repair_tests','veyra_nvenc_tuning_tests') {
+            cmake --build $env:BUILD --target $target --parallel 2
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $exe = Get-ChildItem $env:BUILD -Recurse -Filter "$target.exe" | Select-Object -First 1
+            $process = Start-Process -FilePath $exe.FullName -WorkingDirectory $env:BUILD -PassThru -NoNewWindow
+            if (-not $process.WaitForExit(300000)) { $process.Kill(); throw "$target exceeded 300 seconds" }
+            if ($process.ExitCode -ne 0) { throw "$target failed: $($process.ExitCode)" }
+          }
+
+      - name: Stage original runtime for a private startup check
+        timeout-minutes: 10
+        run: |
+          $zip = "$env:DEPS\veyra-runtime.zip"
+          gh release download v2.2.1 -R Likely7/Veyra-NRVideo -p Veyra-2.2.1-NVIDIA-win64-portable.zip -O $zip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ((Get-FileHash $zip).Hash -ne 'E09150D1594AA9416FA27457A42B4D50B5D814E05471216BEF95B9303544386B') { throw 'Official runtime archive hash mismatch' }
+          Expand-Archive $zip D:\veyra-stage
+          $original = Get-ChildItem D:\veyra-stage -Recurse -Filter veyra_qml_ui.exe | Select-Object -First 1
+          $stage = $original.DirectoryName
+          Copy-Item -LiteralPath $env:VEYRA_BUILT_EXE -Destination $original.FullName -Force
+          Copy-Item "$env:BUILD\shaders\*" "$stage\shaders" -Force
+          "VEYRA_TEST_STAGE=$stage" | Out-File -Append $env:GITHUB_ENV
+          $script = "$env:GITHUB_WORKSPACE\_update\veyra-update\Update-Veyra.ps1"
+          $tokens=$null; $errors=$null
+          [System.Management.Automation.Language.Parser]::ParseFile($script,[ref]$tokens,[ref]$errors) | Out-Null
+          if ($errors.Count) { throw ($errors | Out-String) }
+
+      - name: Verify and stage current DLSS runtime for the startup test
+        timeout-minutes: 5
+        run: |
+          $commit = '9981c6350dc58c0ce21f024fd65e31e851c31689'
+          $hashes = @{
+            'nvngx_dlss.dll'='D00B5B0AB29C3CA101B70C3A5ECB3A01B7EF33766A3383A28A18623083E6123E'
+            'nvngx_dlssg.dll'='8D59D49B36410DD6B62FEF2503A5871D347415BD85D943FA0848563A95DD50C7'
+          }
+          foreach ($name in $hashes.Keys) {
+            $file = Join-Path "$env:VEYRA_TEST_STAGE\runtime\experimental" $name
+            Invoke-WebRequest "https://raw.githubusercontent.com/NVIDIA/DLSS/$commit/lib/Windows_x86_64/rel/$name" -OutFile $file
+            if ((Get-FileHash $file).Hash -ne $hashes[$name]) { throw "DLSS hash mismatch: $name" }
+            $sig = Get-AuthenticodeSignature $file
+            if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=NVIDIA Corporation') { throw 'DLSS signature check failed' }
+          }
+
+      - name: Private startup smoke test
+        timeout-minutes: 5
+        run: |
+          $env:VEYRA_LOG_FILE = 'D:\veyra-startup.log'
+          $env:QT_OPENGL = 'software'
+          $p = Start-Process -FilePath "$env:VEYRA_TEST_STAGE\veyra_qml_ui.exe" -WorkingDirectory $env:VEYRA_TEST_STAGE -ArgumentList @('--data-dir','D:\veyra-private-data','--no-ngx','--no-features','--exit-after','1500') -PassThru
+          if (-not $p.WaitForExit(60000)) { $p.Kill(); throw 'Startup timed out' }
+          if ($p.ExitCode -ne 0) { throw "Veyra startup failed: $($p.ExitCode)" }
+          $log = Get-Content D:\veyra-startup.log -Raw
+          if ($log -match 'failed to load component|QQmlApplicationEngine failed|ReferenceError|TypeError') { throw 'QML startup error' }
+          Write-Host 'Startup passed. NVIDIA GPU quality/latency/recording checks require the actual RTX card.'
+
+      - name: Package reversible update without proprietary DLL redistribution
+        run: |
+          $name = "Veyra-$env:VEYRA_BUILD_VERSION-NVIDIA-update"
+          $root = Join-Path $env:GITHUB_WORKSPACE "dist\$name"
+          $payload = Join-Path $root 'payload'
+          New-Item -ItemType Directory -Force "$payload\shaders","$payload\qml","$root\licenses" | Out-Null
+          Copy-Item $env:VEYRA_BUILT_EXE "$payload\veyra_qml_ui.exe"
+          Copy-Item "$env:BUILD\shaders\*" "$payload\shaders" -Recurse
+          Copy-Item qml\* "$payload\qml" -Recurse
+          Copy-Item "$env:GITHUB_WORKSPACE\_update\veyra-update\Update-Veyra.ps1","$env:GITHUB_WORKSPACE\_update\veyra-update\Install-Update.cmd" $root
+          Copy-Item LICENSE,THIRD_PARTY_NOTICES.md "$root\licenses"
+          Copy-Item "$env:DEPS\dlss\LICENSE.txt" "$root\licenses\NVIDIA-DLSS.txt"
+          $header = Get-Content "$env:DEPS\nv-codec-headers\include\ffnvcodec\nvEncodeAPI.h" -Raw
+          $notice = [regex]::Match($header,'(?s)/\*.*?\*/').Value
+          if (-not $notice) { throw 'NVENC copyright notice missing' }
+          $notice | Set-Content "$root\licenses\nv-codec-headers.txt" -Encoding UTF8
+          $files = @(Get-ChildItem $payload -Recurse -File | ForEach-Object {
+            @{path=$_.FullName.Substring($payload.Length+1).Replace('\','/');sha256=(Get-FileHash $_.FullName).Hash}
+          })
+          @{version=$env:VEYRA_BUILD_VERSION;source='https://github.com/Likely7/Veyra-NRVideo/tree/b9cc86aa9f68462ea740afe6104db4d5ce227aeb';dlssSdk='310.9.16';videoCodecSdk='13.1.15';files=$files} |
+            ConvertTo-Json -Depth 5 | Set-Content "$root\update-manifest.json" -Encoding UTF8
+          @"
+          Veyra 2.2.1 NVIDIA SDK update for RTX 50-series.
+          Close Veyra, then double-click Install-Update.cmd.
+          Original files are backed up under the Veyra installation's sdk-backups folder.
+          To restore: Install-Update.cmd -Rollback
+          This is a custom build. Source: https://github.com/Likely7/Veyra-NRVideo/tree/b9cc86aa9f68462ea740afe6104db4d5ce227aeb
+          Build recipe: https://github.com/$env:GITHUB_REPOSITORY/tree/$env:GITHUB_SHA
+          DLSS 310.9.16 DLLs download from NVIDIA's immutable source commit during installation.
+          Video Effects SDK 1.3.0, the original patched FFmpeg, user settings and NVIDIA driver remain.
+          Hardware SR/FG quality, HDR, latency and NVENC require testing on your RTX 5070 Ti.
+          "@ | Set-Content "$root\README.txt" -Encoding UTF8
+          $zip = "$root.zip"
+          Compress-Archive "$root\*" $zip
+          (Get-FileHash $zip).Hash | Set-Content "$zip.sha256"
+          Write-Host "Created $zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Veyra-NVIDIA-SDK-update
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
