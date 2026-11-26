@@ -60,7 +60,7 @@ public:
         gfx::D3D12DeviceContext&,gfx::CommandSlotRing&,pipeline::EnhanceGraph&,
         std::shared_ptr<pipeline::FrameLease>,bool generated,bool referencesValid,
         int comparison,bool baseReference,float split,pipeline::FrameIdentity,
-        PreviewView,int64_t sourcePts100ns,int64_t deadline100ns,int64_t expiry100ns,
+        PreviewView,int64_t sourcePts100ns,int64_t deadline100ns,int64_t expiry100ns,int64_t capacityBudget100ns,
         uint64_t reflexFrame,bool hdrCoverage,std::function<bool()> valid);
     // Completion/fence publication stays on the graph owner, including cancel.
     bool finishNativePresent(const std::shared_ptr<AsyncPresentation>&,pipeline::EnhanceGraph&,bool cancel=false);
@@ -166,6 +166,8 @@ void recordGpuTimings(){std::lock_guard presenterLock(presentationMutex_);gpuTim
 private:
     mutable std::recursive_mutex presentationMutex_;
     NativePresentWorker nativeWorker_;
+    unsigned hdrPeakLogs_=0,doviFollowLogs_=0;
+    std::chrono::steady_clock::time_point nextNativeLog_{};
     template<class Graph> bool presentFrame(gfx::D3D12DeviceContext&,gfx::CommandSlotRing&,Graph&,unsigned,bool,bool,int,bool,float,pipeline::FrameIdentity,PreviewView,int64_t,bool);
     // Custom: HDR10 static metadata for the display (MaxCLL / MaxFALL / mastering
     // peak). Sent only when it changes, and cleared when the HDR10 path stops.

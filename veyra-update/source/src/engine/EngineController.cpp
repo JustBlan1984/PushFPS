@@ -3738,9 +3738,17 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                             if(readiness==PreviewFrameReadiness::Expired){++generatedDropDeadline;++s.dropped;++s.handled;++s.next;s.deadlineStart.reset();s.capacityStart.reset();continue;}
                             if(!s.async&&physicalCapture&&options.fg&&timeline.paced()&&
                                presentationEffective.outputRate!=OutputRateMode::Custom&&presenter->canAsyncPresent()){
+                                const double outputIntervalMs=sourceIntervalMs/std::max(1u,batch.batch.count);
+                                const double capacityBase=smoothedCapacity?liveSmoothedCapacityWaitMs(outputIntervalMs,fixedCapacityWait?0:liveArrival.jitterMs()):2.0;
+                                double capacityBudget=std::min(capacityBase,outputIntervalMs/2);
+                                if(halfRate&&batch.batch.count==2&&presentationEffective.display==DisplaySync::Vsync&&!presenter->vrrSync()&&!fixedCapacityWait){
+                                    const auto grid=presenter->refreshGrid();
+                                    capacityBudget=liveHalfRateCapacityWaitMs(capacityBase,outputIntervalMs,grid.period100ns/10000,
+                                        double(timeline.deadline(batch.batch.b100ns)-std::max(host100ns(),timeline.deadline(item.pts100ns)))/10000);
+                                }
                                 s.async=presenter->queueNativePresent(ctx,ring,*graph,item.lease,generated,item.lease->referencesValid,
                                     comparisonMode_,comparisonBase_,comparisonSplit_,item.identity,previewView(),item.pts100ns,
-                                    timeline.deadline(item.pts100ns),timeline.deadline(item.pts100ns)+generatedGrace,
+                                    timeline.deadline(item.pts100ns),timeline.deadline(item.pts100ns)+generatedGrace,int64_t(capacityBudget*10000),
                                     watch->reflexFrame,hdrCoverageObserved_.load(),
                                     [this,&presentationGeneration,jobGeneration]{
                                         return !stop_&&!paused_&&seekSeconds_<0&&presentationGeneration.load()==jobGeneration;
@@ -3917,7 +3925,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                             }
                             // Real B owns captureArrival. Generated A/B frames and
                             // paused cached frames must not invent input anchors.
-                            if(didPresent&&physicalCapture&&!generated&&!rereadCached)captureSource.videoPresented(double(captureClockCorrected?driverPts100ns:item.pts100ns)/10000,host100ns(),captureArrival);
+                            if(didPresent&&physicalCapture&&!generated&&!rereadCached)captureSource.videoPresented(double(captureClockCorrected?driverPts100ns:item.pts100ns)/10000,presentEndHost,captureArrival);
 #ifdef VEYRA_ENABLE_REMOTEPLAY
                             if(didPresent&&remote)remote->videoPresented(double(item.pts100ns)/10000,host100ns());
 #endif
@@ -3953,7 +3961,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                                 const auto deadline=timeline.deadline(item.pts100ns),ready=watch->frameReadyObserved[s.next];
                                 if(ready>0&&(ready<=deadline||s.seenUnfinished[s.next]))deadlineMargin.observe(host100ns(),deadline,ready,pairExtra);
                             }
-                            if(didPresent){++s.handled;++s.count;flow->presented(generated,item.lease->consumerFence,presentEndHost,async?async->call100ns:presenter->lastPresentCallHost100ns());if(!generated)++presentationCompletedReal;s.ageMs=double(host100ns()-captureArrival)/10000;
+                            if(didPresent){++s.handled;++s.count;flow->presented(generated,item.lease->consumerFence,presentEndHost,async?async->call100ns:presenter->lastPresentCallHost100ns());if(!generated)++presentationCompletedReal;s.ageMs=double(presentEndHost-captureArrival)/10000;
                                 if(flow==frameFlow){const auto time=host100ns();liveSubmissions.push_back(time);while(liveSubmissions.size()>1&&time-liveSubmissions.front()>10000000)liveSubmissions.pop_front();}}
                             ++s.next;
                         }

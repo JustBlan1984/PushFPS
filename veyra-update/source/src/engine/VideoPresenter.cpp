@@ -383,7 +383,7 @@ bool VideoPresenter::presentFrame(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotR
     {
         // Custom: one-shot record of what the display reports and whether it was
         // trusted, so the curve's effective target is never a guess.
-        static unsigned peakLogged = 0;
+        auto& peakLogged=hdrPeakLogs_;
         if (peakLogged < 2 && graph.hdrOutput()) {
             ++peakLogged;
             veyra::log::info("hdr-peak", std::format(
@@ -560,7 +560,7 @@ bool VideoPresenter::presentFrame(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotR
     if(traceDovi){
         // Gated trace: proves the per-frame curve reached the blit constants.
         // Throttled like the source-side dovi-probe so a long file stays small.
-        static int doviFollowCount=0;
+        auto& doviFollowCount=doviFollowLogs_;
         if(doviFollowCount<3||doviFollowCount%200==0){
             const std::string sourceLabel=latestDovi_.profile==pipeline::kHdr10PlusProfile?"HDR10+":
                 (latestDovi_.profile==0?"none":std::format("DV{}",int(latestDovi_.profile)));
@@ -851,20 +851,24 @@ std::shared_ptr<VideoPresenter::AsyncPresentation> VideoPresenter::queueNativePr
     gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& shared,pipeline::EnhanceGraph& graph,
     std::shared_ptr<pipeline::FrameLease> lease,bool generated,bool referencesValid,
     int comparison,bool baseReference,float split,pipeline::FrameIdentity identity,
-    PreviewView view,int64_t pts,int64_t deadline,int64_t expiry,uint64_t reflexFrame,bool coverage,std::function<bool()> valid){
+    PreviewView view,int64_t pts,int64_t deadline,int64_t expiry,int64_t capacityBudget,uint64_t reflexFrame,bool coverage,std::function<bool()> valid){
     std::lock_guard presenterLock(presentationMutex_);
     if(!lease||!lease->ready()||!canAsyncPresent())return {};
     auto state=std::make_shared<AsyncPresentation>();state->lease=lease;state->ticket=std::make_shared<NativePresentWorker::Ticket>();
     auto snapshot=std::make_shared<NativeFrameSnapshot>(graph,lease->slot,generated);
     const auto dovi=latestDovi_;
-    auto accepted=nativeWorker_.submit(deadline,[this,&ctx,&shared,state,snapshot,generated,referencesValid,comparison,baseReference,split,identity,view,pts,expiry,reflexFrame,coverage,dovi,valid,deadline]{
+    auto accepted=nativeWorker_.submit(deadline,[this,&ctx,&shared,state,snapshot,generated,referencesValid,comparison,baseReference,split,identity,view,pts,expiry,reflexFrame,coverage,dovi,valid,deadline,capacityBudget]{
         // Deadline/capacity waits do not hold the presentation mutex.
+        int64_t capacityUntil=0;
         while(true){
             if(state->ticket->cancelled.load()||(valid&&!valid()))return;
             if(generated&&nativeHost100ns()>expiry){state->success=true;return;}
             bool ready;{std::lock_guard lock(presentationMutex_);ready=sink_.presentationReady();}
             if(ready)break;
-            if(nativeHost100ns()>expiry+20000000)return;
+            const auto now=nativeHost100ns();
+            if(!capacityUntil)capacityUntil=now+capacityBudget;
+            if(generated&&now>=capacityUntil){state->success=true;return;}
+            if(now>expiry+20000000)return;
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
         std::lock_guard lock(presentationMutex_);
@@ -877,10 +881,9 @@ std::shared_ptr<VideoPresenter::AsyncPresentation> VideoPresenter::queueNativePr
         state->success=presentFrame(ctx,shared,*snapshot,state->lease->slot,generated,referencesValid,comparison,baseReference,split,identity,view,pts,false);
         state->end100ns=nativeHost100ns();state->call100ns=lastPresentCallHost100ns_;
         state->submitted=sink_.presentCount()>before;state->consumerFence=presentationRing_.lastSignaledValue();state->fence=presentationFence_;
-        static auto nextWorkerLog=std::chrono::steady_clock::time_point{};
         const auto now=std::chrono::steady_clock::now();
-        if(now>=nextWorkerLog){
-            nextWorkerLog=now+std::chrono::seconds(1);
+        if(now>=nextNativeLog_){
+            nextNativeLog_=now+std::chrono::seconds(1);
             veyra::log::info("native-present-worker",std::format("source={} generated={} hdr={} deadlineLateMs={:.3f} presentMs={:.3f} submitted={} (one leased ready frame; CPU Present timing, not scanout)",
                 identity.sourceFrameId,generated,snapshot->hdrOutput(),double(state->begin100ns-deadline)/10000,double(state->end100ns-state->begin100ns)/10000,state->submitted));
         }
