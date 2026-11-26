@@ -81,7 +81,7 @@ try {
         # Replace the executable last. File.Replace uses no backup filename.
         foreach ($file in ($pending | Sort-Object @{Expression={if($_.path -eq 'veyra_qml_ui.exe'){1}else{0}}})) {
             if (Test-Path -LiteralPath $file.target -PathType Leaf) {
-                [IO.File]::Replace($file.next,$file.target,$null)
+                [IO.File]::Replace($file.next,$file.target,[System.Management.Automation.Language.NullString]::Value)
             } else {
                 [IO.File]::Move($file.next,$file.target)
             }
