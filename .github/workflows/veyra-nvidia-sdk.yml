@@ -27,11 +27,7 @@ env:
   CMAKE_BUILD_PARALLEL_LEVEL: 2
   VCPKG_MAX_CONCURRENCY: 2
   CARGO_BUILD_JOBS: 2
-  SCCACHE_GHA_ENABLED: "true"
-  SCCACHE_GHA_VERSION: "veyra-msvc-v1"
   SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
-  CMAKE_C_COMPILER_LAUNCHER: sccache
-  CMAKE_CXX_COMPILER_LAUNCHER: sccache
   UPSTREAM_REPO: Likely7/Veyra-NRVideo
   # The runtime package (Qt, FFmpeg, the vendors' runtimes) the installer downloads. 2.2.1's has the same
   # vendor runtimes as 2.1.9's (upstream-inspect, 24 November 2026: every file under runtime\ has the same
@@ -177,10 +173,9 @@ jobs:
           echo "XeSS root: $xess"; echo "FidelityFX 1.x root: ${ffx1:-not found}"
           if [ -z "$ffx1" ]; then echo "::error::FidelityFX 1.1.4 optical flow libraries not found; PushFPS needs them for optical flow"; exit 1; fi
 
-      # Restore and save are separate steps: actions/cache only saves when the whole job succeeds,
-      # and FFmpeg takes ~25 minutes to build, so it is saved as soon as it is built. vcpkg reuses a
-      # cached package only when its ABI hash (compiler included) matches, so every run saves its
-      # binary cache under a new key and restores the newest one.
+      # Preserve completed dependency packages even if the app later fails.
+      # Compiler, SDK and recipe keys reuse unchanged binaries without saving
+      # another complete dependency cache for every workflow run.
       - name: Restore vcpkg binaries
         id: vcpkg-cache
         uses: actions/cache/restore@v4
