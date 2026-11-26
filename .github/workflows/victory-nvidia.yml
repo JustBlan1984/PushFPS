@@ -49,6 +49,12 @@ jobs:
           key: victory-intel-trial-v1
       - name: Apply reviewed local presentation patch
         run: |
+          $patch = "$env:GITHUB_WORKSPACE\build-scripts\victory-build\fullscreen.patch"
+          foreach ($file in @('crates/victory-gpu/Cargo.toml','crates/victory-gpu/src/host.rs',$patch)) {
+            $absolute = (Resolve-Path -LiteralPath $file).Path
+            $text = [IO.File]::ReadAllText($absolute).Replace("`r`n","`n")
+            [IO.File]::WriteAllText($absolute,$text,[Text.UTF8Encoding]::new($false))
+          }
           git apply --check "$env:GITHUB_WORKSPACE\build-scripts\victory-build\fullscreen.patch"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git apply "$env:GITHUB_WORKSPACE\build-scripts\victory-build\fullscreen.patch"
