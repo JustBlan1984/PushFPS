@@ -376,7 +376,7 @@ jobs:
           if ($log -match 'failed to load component|QQmlApplicationEngine failed|ReferenceError|TypeError') { throw 'QML startup error' }
           Write-Host 'Startup passed. NVIDIA GPU quality/latency/recording checks require the actual RTX card.'
 
-      - name: Package reversible update without proprietary DLL redistribution
+      - name: Package update without backups or proprietary DLL redistribution
         run: |
           $name = "Veyra-$env:VEYRA_BUILD_VERSION-NVIDIA-update"
           $root = Join-Path $env:GITHUB_WORKSPACE "dist\$name"
@@ -400,8 +400,7 @@ jobs:
           @"
           Veyra 2.2.1 NVIDIA SDK update for RTX 50-series.
           Close Veyra, then double-click Install-Update.cmd.
-          Original files are backed up under the Veyra installation's sdk-backups folder.
-          To restore: Install-Update.cmd -Rollback
+          No backups or rollback files are created. Verified temporary downloads are removed after installation.
           This is a custom build. Source: https://github.com/Likely7/Veyra-NRVideo/tree/b9cc86aa9f68462ea740afe6104db4d5ce227aeb
           Build recipe: https://github.com/$env:GITHUB_REPOSITORY/tree/$env:GITHUB_SHA
           DLSS 310.9.16 DLLs download from NVIDIA's immutable source commit during installation.
@@ -412,6 +411,31 @@ jobs:
           Compress-Archive "$root\*" $zip
           (Get-FileHash $zip).Hash | Set-Content "$zip.sha256"
           Write-Host "Created $zip"
+
+
+      - name: Updater file replacement test with a mocked hardware gate
+        timeout-minutes: 5
+        run: |
+          $package = Get-ChildItem "$env:GITHUB_WORKSPACE\dist" -Directory | Select-Object -First 1
+          $testRoot = 'D:\veyra-updater-fixture'
+          New-Item -ItemType Directory -Force "$testRoot\versions\2.2.1\runtime\experimental","$testRoot\runtime_local" | Out-Null
+          Set-Content "$testRoot\current-version.txt" '2.2.1'
+          Set-Content "$testRoot\versions\2.2.1\veyra_qml_ui.exe" 'old executable fixture'
+          Set-Content "$testRoot\versions\2.2.1\runtime\experimental\nvngx_dlss.dll" 'old SR fixture'
+          Set-Content "$testRoot\versions\2.2.1\runtime\experimental\nvngx_dlssg.dll" 'old FG fixture'
+          Set-Content "$testRoot\runtime_local\settings-keep.txt" 'keep user settings'
+          # Only the hardware eligibility query is mocked. All downloads,
+          # NVIDIA signatures, file hashes and actual replacements are real.
+          function Get-CimInstance { [pscustomobject]@{Name='NVIDIA GeForce RTX 5070 Ti';DriverVersion='32.0.16.2140'} }
+          & "$($package.FullName)\Update-Veyra.ps1" -InstallRoot $testRoot
+          $manifest = Get-Content "$($package.FullName)\update-manifest.json" -Raw | ConvertFrom-Json
+          foreach ($file in $manifest.files) {
+            if ((Get-FileHash (Join-Path "$testRoot\versions\2.2.1" $file.path)).Hash -ne $file.sha256) { throw 'Updated payload differs from manifest' }
+          }
+          if (((Get-Content "$testRoot\runtime_local\settings-keep.txt" -Raw).Trim()) -ne 'keep user settings') { throw 'Settings changed' }
+          if (Test-Path "$testRoot\sdk-backups") { throw 'Unexpected backup folder' }
+          if (@(Get-ChildItem $testRoot -Recurse -File | Where-Object Name -like '*.sdk-update-*').Count) { throw 'Temporary replacement files remain' }
+          Write-Host 'Updater replacement, signature/hash verification, settings preservation and no-backup checks PASS. GPU execution was not tested.'
 
       - uses: actions/upload-artifact@v4
         with:

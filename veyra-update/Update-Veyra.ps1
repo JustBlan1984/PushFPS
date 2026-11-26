@@ -1,7 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'Programs\Veyra (NVIDIA)'),
-    [switch]$Rollback
+    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'Programs\Veyra (NVIDIA)')
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -17,7 +16,6 @@ $running = Get-Process Veyra,veyra_qml_ui,veyra_update_worker -ErrorAction Silen
     try { $_.Path -and $_.Path.StartsWith($root+'\',[StringComparison]::OrdinalIgnoreCase) } catch { $true }
 }
 if ($running) { throw 'Close Veyra normally, then run this update again. Your session will not be stopped automatically.' }
-$backupRoot = Join-Path $root 'sdk-backups'
 function TargetPath([string]$relative) {
     $target = [IO.Path]::GetFullPath((Join-Path $app $relative))
     if (-not $target.StartsWith($app+'\',[StringComparison]::OrdinalIgnoreCase)) { throw 'Invalid update path.' }
@@ -29,26 +27,6 @@ function TargetPath([string]$relative) {
     }
     if ((Test-Path -LiteralPath $target) -and ((Get-Item -LiteralPath $target).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'A linked file needs manual review.' }
     return $target
-}
-function RestoreFiles($backup,$receipt) {
-    foreach ($file in $receipt.files) {
-        $target = TargetPath $file.path
-        if ($file.existed) {
-            $original = Join-Path $backup ('original\'+$file.path)
-            if ((Get-FileHash -LiteralPath $original).Hash -ne $file.originalSha256) { throw 'Backup verification failed.' }
-            Copy-Item -LiteralPath $original -Destination $target -Force
-        } elseif (Test-Path -LiteralPath $target) {
-            Remove-Item -LiteralPath $target -Force
-        }
-    }
-}
-if ($Rollback) {
-    $backup = Get-ChildItem -LiteralPath $backupRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
-    if (-not $backup) { throw 'No SDK update backup was found.' }
-    $receipt = Get-Content -LiteralPath (Join-Path $backup.FullName 'receipt.json') -Raw | ConvertFrom-Json
-    RestoreFiles $backup.FullName $receipt
-    Write-Host 'Original Veyra files restored. Settings and driver were not changed.'
-    exit 0
 }
 $gpus = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA.*RTX\s*50\d\d' })
 if (-not $gpus.Count) { throw 'This native DLSS runtime update is prepared for RTX 50-series GPUs.' }
@@ -88,37 +66,35 @@ try {
         if (((Get-Item -LiteralPath $source).VersionInfo.FileVersion -replace ',\s*','.') -ne '310.9.16.0') { throw 'Unexpected NVIDIA DLL version.' }
         $entries += [pscustomobject]@{path=('runtime/experimental/'+$name);source=$source;sha256=$dlls[$name]}
     }
-    $backup = Join-Path $backupRoot ((Get-Date -Format 'yyyyMMdd-HHmmss')+'-'+[guid]::NewGuid().ToString('N').Substring(0,6))
-    New-Item -ItemType Directory -Path $backup -Force | Out-Null
-    $records = @()
-    foreach ($file in $entries) {
-        $target = TargetPath $file.path
-        $existed = Test-Path -LiteralPath $target -PathType Leaf
-        $hash = ''
-        if ($existed) {
-            $hash = (Get-FileHash -LiteralPath $target).Hash
-            $original = Join-Path $backup ('original\'+$file.path)
-            New-Item -ItemType Directory -Path (Split-Path -Parent $original) -Force | Out-Null
-            Copy-Item -LiteralPath $target -Destination $original
-            if ((Get-FileHash -LiteralPath $original).Hash -ne $hash) { throw 'Backup copy differs from original.' }
-        }
-        $records += [pscustomobject]@{path=$file.path;existed=$existed;originalSha256=$hash;updatedSha256=$file.sha256}
-    }
-    $receipt = @{baseVersion='2.2.1';dlssSdk='310.9.16';videoCodecSdk='13.1.15';files=$records;source=$manifest.source}
-    $receipt | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $backup 'receipt.json') -Encoding UTF8
+    # Stage replacement bytes beside their destinations. This verifies write
+    # access before replacement and creates no copies of the original files.
+    $pending = @()
     try {
         foreach ($file in $entries) {
             $target = TargetPath $file.path
             New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
-            Copy-Item -LiteralPath $file.source -Destination $target -Force
-            if ((Get-FileHash -LiteralPath $target).Hash -ne $file.sha256) { throw 'Installed file verification failed.' }
+            $next = $target + '.sdk-update-' + [guid]::NewGuid().ToString('N')
+            $pending += [pscustomobject]@{path=$file.path;target=$target;next=$next;sha256=$file.sha256}
+            Copy-Item -LiteralPath $file.source -Destination $next
+            if ((Get-FileHash -LiteralPath $next).Hash -ne $file.sha256) { throw 'Staged replacement verification failed.' }
         }
-    } catch {
-        RestoreFiles $backup $receipt
-        throw 'Update failed; original files were restored.'
+        # Replace the executable last. File.Replace uses no backup filename.
+        foreach ($file in ($pending | Sort-Object @{Expression={if($_.path -eq 'veyra_qml_ui.exe'){1}else{0}}})) {
+            if (Test-Path -LiteralPath $file.target -PathType Leaf) {
+                [IO.File]::Replace($file.next,$file.target,$null)
+            } else {
+                [IO.File]::Move($file.next,$file.target)
+            }
+            if ((Get-FileHash -LiteralPath $file.target).Hash -ne $file.sha256) { throw 'Installed file verification failed.' }
+        }
+    } finally {
+        foreach ($file in $pending) {
+            if (Test-Path -LiteralPath $file.next) { Remove-Item -LiteralPath $file.next -Force }
+        }
     }
-    Write-Host "Veyra updated. Backup: $backup"
-    Write-Host 'DLSS 310.9.16 and Video Codec SDK 13.1.15. Your settings, VFG engine, patched FFmpeg and driver were preserved.'
+    Write-Host 'Veyra updated: DLSS 310.9.16 and Video Codec SDK 13.1.15.'
+    Write-Host 'No backups or rollback files were created. Settings, VFG, patched FFmpeg and driver were preserved.'
+
 } finally {
     $fullStage = [IO.Path]::GetFullPath($stage)
     $tempPrefix = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\')+'\Veyra-sdk-'
