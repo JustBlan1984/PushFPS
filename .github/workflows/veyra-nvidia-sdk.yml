@@ -68,6 +68,12 @@ jobs:
           path: veyra-src
 
       # A release tag (v2.1.5) builds exactly that version; every other build is 2.1.5-pushfps.<run>.
+      - name: Apply the SDK 13.1 encoder integration
+        run: |
+          robocopy "$env:GITHUB_WORKSPACE\_update\veyra-update\source" . /E /NFL /NDL /NJH /NJS /NP
+          if ($LASTEXITCODE -ge 8) { throw 'SDK integration files could not be applied' }
+          $global:LASTEXITCODE = 0
+          git diff --stat
       - name: Version and source identity
         run: |
           "VEYRA_BUILD_VERSION=2.2.1-nvidia-sdk.$env:GITHUB_RUN_NUMBER" | Out-File -Append $env:GITHUB_ENV
@@ -307,6 +313,15 @@ jobs:
             -DVEYRA_UPDATE_PUBLIC_KEY=984321f24a445f642c368a3a0d218dff75820138766a0b8e4c1281f3b871daa2 @dovi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+
+      - name: SDK ABI and driver-version contract test
+        timeout-minutes: 5
+        run: |
+          New-Item -ItemType Directory -Force D:\sdk-tests | Out-Null
+          cl /nologo /std:c++20 /EHsc /W4 /I include "/I$env:DEPS\nv-codec-headers\include" tests/unit/NvencSdkContractTests.cpp /Fe:D:\sdk-tests\nvenc-contract.exe /Fo:D:\sdk-tests\nvenc-contract.obj
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & D:\sdk-tests\nvenc-contract.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build Veyra with current NVIDIA SDK headers and libraries
         timeout-minutes: 15
