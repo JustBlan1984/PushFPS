@@ -51,6 +51,7 @@
 #include "veyra/ngx/NgxCoreCache.h"
 #include "veyra/diagnostics/ResetCause.h"
 #include "veyra/diagnostics/CpuStallTrace.h"
+#include "veyra/diagnostics/NrPassTiming.h"
 #include "veyra/sink/WasapiAudioSink.h"
 #include "veyra/sink/ImageExportSink.h"
 #include "veyra/gfx/D3D12DeviceContext.h"
@@ -1548,9 +1549,25 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                 // The recording ends with the session; its file is finished in the background.
                 recorder_->sessionEnded(stop_?L"播放已停止，录制已保存":L"播放已结束，录制已保存");
                 replay_->sessionEnded({});virtualCamera_->sessionEnded();screenText_->sessionEnded();}};
+            int64_t nextNrStageCostLog=0;
             auto collectTimings=[&]{
                 auto record=[&](const diagnostics::GpuFrameTiming& sample){
                     const auto& fgCost=sample.gpu[size_t(diagnostics::GpuStage::FgBatch)];
+                    const auto nrLogNow=host100ns();
+                    const auto& nrCost=sample.gpu[size_t(diagnostics::GpuStage::Nr)];
+                    if(physicalCapture&&sample.identity.settingsRevision==options.settings.revision&&
+                       nrCost.state==diagnostics::SampleState::Measured&&nrLogNow>=nextNrStageCostLog){
+                        nextNrStageCostLog=nrLogNow+10000000;
+                        const auto& layer=sample.gpu[size_t(diagnostics::GpuStage::NrLayer0)];
+                        const auto tail=options.settings.activeNrLayerCount()==1&&layer.state==diagnostics::SampleState::Measured?
+                            diagnostics::nrDecodeTailMs(layer.begin,layer.end,layer.frequency,nrCost.begin,nrCost.end,nrCost.frequency):std::optional<double>{};
+                        const auto& flow=sample.gpu[size_t(diagnostics::GpuStage::Flow)];
+                        const auto& residual=sample.gpu[size_t(diagnostics::GpuStage::Residual)];
+                        veyra::log::info("nr-stage-cost",std::format(
+                            "revision={} source={} flowGpuMs={:.3f} nrEvaluateGpuMs={:.3f} decodeAndTransitionsGpuMs={:.3f} residualGpuMs={:.3f} (same-frame GPU samples; decode tail only for one NR layer; -1 unknown)",
+                            sample.identity.settingsRevision,sample.identity.sourceFrameId,flow.milliseconds.value_or(-1.0),
+                            nrCost.milliseconds.value_or(-1.0),tail.value_or(-1.0),residual.milliseconds.value_or(-1.0)));
+                    }
                     for(auto& watch:pendingCompletions){
                         const auto& id=watch->output.batch.identity;
                         if(id.epoch==sample.identity.epoch&&id.settingsRevision==sample.identity.settingsRevision&&id.sourceFrameId==sample.identity.sourceFrameId){

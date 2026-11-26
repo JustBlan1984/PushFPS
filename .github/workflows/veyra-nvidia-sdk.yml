@@ -365,6 +365,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & D:\sdk-tests\capture-ready-audit.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cl /nologo /std:c++20 /EHsc /W4 /I include tests/unit/NrInputParameterCacheTests.cpp /Fe:D:\sdk-tests\nr-input-cache.exe /Fo:D:\sdk-tests\nr-input-cache.obj
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & D:\sdk-tests\nr-input-cache.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build Veyra with current NVIDIA SDK headers and libraries
         timeout-minutes: 15
@@ -460,6 +464,9 @@ jobs:
             ConvertTo-Json -Depth 5 | Set-Content "$root\update-manifest.json" -Encoding UTF8
           @"
           Veyra 2.2.1 engine optimization EXPERIMENT for RTX 50-series.
+          Adds NR scalar input parameter caching for the community SF runtime and NR pass-cost diagnostics.
+          Resource bindings/reset remain per-frame. Set VEYRA_DISABLE_NR_PARAMETER_CACHE=1 before launch for the prior parameter-write path.
+          Model, dimensions, enhancement controls, shaders and HDR processing remain unchanged.
           Adds CPU graph/readiness interval and phase reserve diagnostics.
           Default phase guard remains 0.5 ms. Optional 0.25 ms comparison is described in CAPTURE_PHASE_AUDIT.md.
           Includes the previously verified NVIDIA SDK updates.
@@ -477,6 +484,7 @@ jobs:
           "@ | Set-Content "$root\README.txt" -Encoding UTF8
           Copy-Item "$env:GITHUB_WORKSPACE\_update\veyra-update\Start-Veyra-*-Guard.cmd" $root
           Copy-Item "$env:GITHUB_WORKSPACE\_update\veyra-update\CAPTURE_PHASE_AUDIT.md" $root
+          Copy-Item "$env:GITHUB_WORKSPACE\_update\veyra-update\NR_PARAMETER_CACHE.md" $root
           $zip = "$root.zip"
           Compress-Archive "$root\*" $zip
           (Get-FileHash $zip).Hash | Set-Content "$zip.sha256"
