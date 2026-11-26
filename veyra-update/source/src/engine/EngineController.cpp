@@ -1748,7 +1748,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                 // A checkpoint must never stall enhancement behind a worker's DXGI call.
                 auto access=presenter->tryPresentationAccess();
                 if(!access.owns_lock())return;
-                if(!checkpointPresentation||!isCapture||!options.fg||(graph->hdrOutput()&&(!physicalCapture||presentationEffective.outputRate==OutputRateMode::Custom||!presenter->canAsyncPresent()))||!presenter->independentQueue()||
+                if(!checkpointPresentation||!isCapture||!options.fg||(graph->hdrOutput()&&(!physicalCapture||outputCaptures_.needsFrame()||presentationEffective.outputRate==OutputRateMode::Custom||!presenter->canAsyncPresent()))||!presenter->independentQueue()||
                    !liveScheduler||stop_||(paused_&&!seekPreviewPending)||seekSeconds_>=0)return;
                 const auto due=liveScheduler->wakeAt(),now=host100ns();
                 if(due>0&&due<=now)liveScheduler->advance(now);
@@ -3739,7 +3739,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                                 veyra::log::info("fg-drops",std::format("revision={} deadline={} capacity={} cap={} graceMs={:.1f} (session totals of frames dropped before Present, by reason)",item.identity.settingsRevision,generatedDropDeadline,generatedDropCapacity,generatedDropCap,double(generatedGrace)/10000));
                             }
                             if(readiness==PreviewFrameReadiness::Expired){++generatedDropDeadline;++s.dropped;++s.handled;++s.next;s.deadlineStart.reset();s.capacityStart.reset();continue;}
-                            if(!s.async&&physicalCapture&&options.fg&&timeline.paced()&&
+                            if(!s.async&&physicalCapture&&options.fg&&timeline.paced()&&!outputCaptures_.needsFrame()&&
                                presentationEffective.outputRate!=OutputRateMode::Custom&&presenter->canAsyncPresent()){
                                 const double outputIntervalMs=sourceIntervalMs/std::max(1u,batch.batch.count);
                                 const double capacityBase=smoothedCapacity?liveSmoothedCapacityWaitMs(outputIntervalMs,fixedCapacityWait?0:liveArrival.jitterMs()):2.0;
