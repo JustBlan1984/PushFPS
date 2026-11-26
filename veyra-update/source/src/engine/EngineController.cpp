@@ -1420,7 +1420,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
             uint32_t testArrivalSeed=7;int64_t testCardStart=0;double testCardFirstPtsMs=0;
             const unsigned testReplayDropEvery=[]{wchar_t value[16]{};return GetEnvironmentVariableW(L"VEYRA_TEST_REPLAY_DROP_EVERY",value,16)?unsigned(std::clamp(_wtoi(value),0,120)):0u;}();
             bool testReplayDropPending=false;
-            int64_t nextFgAdmissionLog=0,nextFgRejectionLog=0;
+            int64_t nextFgAdmissionLog=0,nextFgRejectionLog=0,nextPairPhaseClockLog=0;
             uint64_t fgAdmittedPairs=0,fgRejectedPairs=0,fgReducedPairs=0;int64_t nextFgReducedLog=0;
             std::atomic<uint64_t> historyResets=0,presentationDrains=0,presentationCompletedReal=0,presentationSkippedGenerated=0,presentationCancelledJobs=0;
             std::atomic<uint64_t> presentationGeneration{0};
@@ -3260,15 +3260,13 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                 if(isCapture&&!rereadCached&&!presentSinkFrameGeneration(options.settings.frameGenerationBackend)){
                     const auto presentP95=livePresentGpu.p95();
                     admitFg=[&,presentP95](const pipeline::FrameBatch& batch,bool warmingHistory){
-                        // Physical capture and PS5 delivery clocks are not
-                        // guaranteed to match the host clock. Anchor each new
-                        // input pair before enhancement, so a 59.94-vs-60Hz
-                        // mismatch cannot accumulate into a stale deadline.
-                        // Never extend it based on processing/ready completion.
-                        // Admission asks whether this pair's own frames can make
-                        // it, so it keeps the callback; LiveArrivalSmoother moves
-                        // only the presentation anchor set below.
-                        if(pairAnchoredLive)liveTimeline.resetPair(batch.identity.epoch,batch.b100ns,liveInputReady,pairDelay);
+                        // Content-clock capture must use the same anchor for admission,
+                        // phase learning and presentation. A callback-relative floor
+                        // applied on a later content anchor counted that offset twice.
+                        // The generated deadline must still cover the existing GPU
+                        // readiness prediction; no source PTS or A/B spacing changes.
+                        const auto admissionAnchor=smoothContentAnchor?presentAnchorFor(batch.b100ns):liveInputReady;
+                        if(pairAnchoredLive)liveTimeline.resetPair(batch.identity.epoch,batch.b100ns,admissionAnchor,pairDelay);
                         else if(!liveTimeline.anchored(batch.identity.epoch))liveTimeline.reset(batch.identity.epoch,batch.b100ns,liveInputReady,liveSourceInterval100ns(pkt.duration,activeSource->info().averageFps));
                         const auto interval=liveInterval;
                         const auto a=(historyReset||batch.b100ns<=batch.a100ns||batch.b100ns-batch.a100ns>10000000)?batch.b100ns-interval:batch.a100ns;
@@ -3278,13 +3276,23 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         const auto earliest=now+fgBudget.requiredDeadlineLead(now,elapsed,presentP95,warmingHistory);
                         const bool held=vfgCostSettling.holding(now);
                         const bool adjustPhase=marginPair&&pairAnchoredLive&&!warmingHistory&&!historyReset&&!held;
-                        const auto neededPhase=earliest-liveInputReady+batch.b100ns-lastGenerated-pairExtra;
+                        const auto neededPhase=smoothContentAnchor?
+                            livePairAdmissionPhase100ns(earliest,admissionAnchor,batch.b100ns,lastGenerated,pairExtra):
+                            earliest-liveInputReady+batch.b100ns-lastGenerated-pairExtra;
                         if(adjustPhase){
                             pairDelay=pairLatency.enforceAdmissionFloor(neededPhase,phaseLimit)+pairExtra;
-                            liveTimeline.resetPair(batch.identity.epoch,batch.b100ns,liveInputReady,pairDelay);
+                            liveTimeline.resetPair(batch.identity.epoch,batch.b100ns,admissionAnchor,pairDelay);
                         }
                         const auto deadline=liveTimeline.deadline(lastGenerated);
                         const bool admitted=!held&&fgBudget.admitBy(deadline,earliest);
+                        if(adjustPhase&&smoothContentAnchor&&now>=nextPairPhaseClockLog){
+                            nextPairPhaseClockLog=now+10000000;
+                            veyra::log::info("live-phase-clock",std::format(
+                                "revision={} source={} multiplier={} anchorOffsetMs={:.3f} neededPhaseMs={:.3f} selectedPhaseMs={:.3f} earliestReadyMs={:.3f} generatedDeadlineMs={:.3f} slackMs={:.3f} admitted={} (same anchor for admission and presentation; readiness is predicted, not scanout)",
+                                options.settings.revision,batch.identity.sourceFrameId,previewFgMultiplier,
+                                double(admissionAnchor-liveInputReady)/10000,double(neededPhase)/10000,double(pairDelay)/10000,
+                                double(earliest-liveInputReady)/10000,double(deadline-liveInputReady)/10000,double(deadline-earliest)/10000,admitted));
+                        }
                         if(adjustPhase&&!admitted)pairLatency.observe(now,neededPhase);
                         logAdmission(batch,now,deadline,elapsed,presentP95,admitted,warmingHistory,pairAnchoredLive?(isStream?"decoded-pair":"capture-pair"):"continuous");
                         auto decision=admitted?pipeline::EnhanceGraph::FgDecision::Evaluate:pipeline::EnhanceGraph::FgDecision::Skip;

@@ -4,6 +4,14 @@
 #include <array>
 
 namespace veyra::engine {
+// Solve the generated-frame deadline in its actual presentation clock:
+// anchor + phase + extra - (B - generatedPts) >= earliestGpuReady.
+// A nonnegative phase is conservative when the content anchor already supplies
+// enough time. The caller retains its existing phase cap and rejection policy.
+inline constexpr int64_t livePairAdmissionPhase100ns(int64_t earliestGpuReady,int64_t anchor,
+                                                    int64_t realPts,int64_t generatedPts,int64_t extra) {
+    return std::max<int64_t>(0,earliestGpuReady-anchor+realPts-generatedPts-extra);
+}
 // Observed readiness of earlier pairs bounds the phase of the next pair.
 // Values are host-clock 100 ns; source PTS differences only supply spacing.
 class LivePairLatency {
@@ -17,7 +25,8 @@ public:
     static constexpr int64_t kMargin100ns=5000;
     void reset(){head_=count_=0;selected_=0;}
     void observe(int64_t now,int64_t requiredDelay){
-        if(requiredDelay<=0||requiredDelay>20000000)return;
+        // Zero is valid: a content-clock anchor can already cover all readiness.
+        if(requiredDelay<0||requiredDelay>20000000)return;
         while(count_&&(count_>=samples_.size()||samples_[head_].time<now-10000000)){head_=(head_+1)%samples_.size();--count_;}
         samples_[(head_+count_++)%samples_.size()]={now,requiredDelay};
     }
