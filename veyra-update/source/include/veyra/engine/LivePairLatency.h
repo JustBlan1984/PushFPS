@@ -23,7 +23,16 @@ public:
     // Beyond the 95th percentile of readiness; LiveArrivalSmoother::kLead100ns
     // takes part of it back on callback-anchored capture.
     static constexpr int64_t kMargin100ns=5000;
-    void reset(){head_=count_=0;selected_=0;}
+    struct SelectionAudit {
+        size_t samples=0;
+        int64_t readinessP95=-1,guard=kMargin100ns,target=-1,limit=0;
+        bool warming=true;
+    };
+private:
+    SelectionAudit selection_{};
+public:
+    const SelectionAudit& selectionAudit()const{return selection_;}
+    void reset(){head_=count_=0;selected_=0;selection_={};}
     void observe(int64_t now,int64_t requiredDelay){
         // Zero is valid: a content-clock anchor can already cover all readiness.
         if(requiredDelay<0||requiredDelay>20000000)return;
@@ -36,11 +45,13 @@ public:
         selected_=std::min(std::max(selected_,need),limit);
         return selected_;
     }
-    int64_t select(int64_t now,int64_t legacyDelay,int64_t interval,unsigned multiplier,int64_t samplingAllowance=0){
+    int64_t select(int64_t now,int64_t legacyDelay,int64_t interval,unsigned multiplier,int64_t samplingAllowance=0,int64_t requestedGuard=kMargin100ns){
         std::array<int64_t,64> current{};size_t count=0;
         for(size_t i=0;i<count_;++i){const auto& sample=samples_[(head_+i)%samples_.size()];if(sample.time>=now-10000000)current[count++]=sample.delay;}
-        if(interval<=0||multiplier<2){selected_=0;return legacyDelay;}
+        if(interval<=0||multiplier<2){selected_=0;selection_={};return legacyDelay;}
         const auto limit=legacyDelay+samplingAllowance;
+        const auto guard=std::clamp(requestedGuard,int64_t(2500),kMargin100ns);
+        selection_={count,-1,guard,-1,limit,count<8};
         // A gap in readiness observations is expected when pairs are skipped.
         // Retain the last phase until enough new samples arrive.
         if(count<8){
@@ -54,7 +65,8 @@ public:
         // later sample can move readiness past a deadline on the continuous
         // content clock, and FG whose own interpolation does not fit in the
         // legacy delay (FgRecoveryBudget::phaseAllowance).
-        const auto target=std::min(limit,current[index]+kMargin100ns);
+        const auto target=std::min(limit,current[index]+guard);
+        selection_.readinessP95=current[index];selection_.target=target;
         const auto step=std::min<int64_t>(5000,interval/multiplier/8);
         selected_=std::clamp(selected_?selected_-step:legacyDelay,target,limit);
         return selected_;

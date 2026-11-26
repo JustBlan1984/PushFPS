@@ -25,6 +25,7 @@
 #include "veyra/engine/VfgOverloadEstimate.h"
 #include "veyra/engine/LivePairLatency.h"
 #include "veyra/engine/FrameReadyObservation.h"
+#include "veyra/engine/CaptureReadyAudit.h"
 #include "veyra/engine/RealtimePreviewScheduling.h"
 #include "veyra/engine/CaptureHalfRate.h"
 #include "veyra/engine/ContentDedup.h"
@@ -67,6 +68,7 @@
 #include <filesystem>
 #include <format>
 #include <limits>
+#include <string_view>
 #include <cmath>
 #include <deque>
 #include <algorithm>
@@ -1430,7 +1432,8 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
             struct CompletionWatch {
                 uint64_t reflexFrame=0;
                 int64_t captureArrival=0;
-                int64_t phaseAnchor=0;
+                int64_t phaseAnchor=0,graphCallBegin=0,graphCallEnd=0,watchRegistered=0;
+                std::array<int64_t,pipeline::FrameBatch::Capacity> firstFencePoll{};
                 uint64_t presentationGeneration=0;
                 pipeline::EnhanceGraph::FrameOutputs output;
                 std::shared_ptr<FrameFlowWindow> flow;
@@ -1447,7 +1450,12 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                 std::array<FrameReadyObservation,pipeline::FrameBatch::Capacity> frameReadyObserved{};
             };
             const bool legacyReadyObservation=GetEnvironmentVariableW(L"VEYRA_TEST_LEGACY_READY_OBSERVATION",nullptr,0)>0;
-            int64_t nextFgDeadlineLog=0,nextPhaseReadinessLog=0;
+            const int64_t contentPhaseGuard100ns=[]{
+                wchar_t value[16]{};
+                return GetEnvironmentVariableW(L"VEYRA_TEST_CONTENT_PHASE_GUARD_US",value,16)==3&&
+                    std::wstring_view(value,3)==L"250"?int64_t(2500):LivePairLatency::kMargin100ns;
+            }();
+            int64_t nextFgDeadlineLog=0,nextPhaseReadinessLog=0,nextPhaseReserveLog=0;
             std::vector<std::shared_ptr<CompletionWatch>> pendingCompletions;
             std::shared_ptr<FrameFlowWindow> frameFlow;
             const uint64_t runSessionId=[&]{std::lock_guard lock(mutex_);return snapshot_.sessionId;}();
@@ -1494,6 +1502,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                 // time after a completed one; never move the lower bound past
                 // a fence that may signal between the query and host sampling.
                 const auto pollStart=host100ns();
+                if(!watch.firstFencePoll[index])watch.firstFencePoll[index]=pollStart;
                 const bool complete=item.lease->ready();
                 const auto now=complete?host100ns():pollStart;
                 if(!observed.observe(now,complete))return;
@@ -1647,7 +1656,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                        !batch.historyReset&&!batch.fgRecovery&&!costSettling&&!batch.fgFast&&
                        batch.batch.identity.settingsRevision==fgBudgetRevision&&watch.presentationGeneration==presentationGeneration.load()){
                         int64_t requiredDelay=0,generatedDelay=0,realDelay=0,maxGap=-1;
-                        unsigned fallbackFrames=0,unbracketed=0;
+                        unsigned fallbackFrames=0,unbracketed=0,limitingIndex=0;
                         const auto observed=host100ns();
                         for(unsigned i=0;i<batch.batch.count;++i){const auto& item=batch.batch.frames[i];
                             // resolveGeneration can observe a fence after the
@@ -1658,6 +1667,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                             const auto gap=observation.bracket100ns();
                             if(gap<0)++unbracketed;else maxGap=std::max(maxGap,gap);
                             const auto need=std::max<int64_t>(0,ready-watch.phaseAnchor+batch.batch.b100ns-item.pts100ns);
+                            if(need>=requiredDelay)limitingIndex=i;
                             requiredDelay=std::max(requiredDelay,need);
                             if(item.kind==pipeline::FrameKind::Generated)generatedDelay=std::max(generatedDelay,need);
                             else realDelay=std::max(realDelay,need);
@@ -1670,6 +1680,16 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                                 batch.batch.identity.settingsRevision,batch.batch.identity.sourceFrameId,!legacyReadyObservation,
                                 double(requiredDelay)/10000,double(generatedDelay)/10000,double(realDelay)/10000,
                                 maxGap<0?-1.0:double(maxGap)/10000,unbracketed,fallbackFrames));
+                            const auto timing=CaptureReadyAudit::measure(watch.captureArrival,watch.graphCallBegin,
+                                watch.graphCallEnd,watch.watchRegistered,watch.firstFencePoll[limitingIndex],
+                                watch.frameReadyObserved[limitingIndex].ready100ns());
+                            const auto ms=[](int64_t ticks){return ticks<0?-1.0:double(ticks)/10000;};
+                            veyra::log::info("live-submit-ready",std::format(
+                                "revision={} source={} limitingSubframe={} callbackToGraphMs={:.3f} graphCallCpuMs={:.3f} graphReturnToWatchMs={:.3f} graphReturnToFirstPollMs={:.3f} graphReturnToReadyUpperMs={:.3f} graphGpuSpanMs={:.3f} fgGpuMs={:.3f} firstFgGpuMs={:.3f} (CPU intervals overlap GPU execution; graph return is not a queue submission timestamp; -1 unknown)",
+                                batch.batch.identity.settingsRevision,batch.batch.identity.sourceFrameId,limitingIndex,
+                                ms(timing.callbackToGraph),ms(timing.graphCall),ms(timing.graphReturnToWatch),
+                                ms(timing.graphReturnToFirstPoll),ms(timing.graphReturnToReady),watch.gpuExecutionMs.value_or(-1.0),
+                                watch.fgExecutionMs.value_or(-1.0),watch.firstFgExecutionMs.value_or(-1.0)));
                         }
                     }
                     completeReset(batch.batch.identity);
@@ -3282,7 +3302,8 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                 const auto phaseAllowance=std::max(transportInterval/2,fgPhaseAllowance);
                 const auto phaseLimit=legacyPairDelay+phaseAllowance;
                 auto pairDelay=marginPair?
-                    pairLatency.select(host100ns(),legacyPairDelay,liveInterval,previewFgMultiplier,phaseAllowance)+pairExtra:legacyPairDelay;
+                    pairLatency.select(host100ns(),legacyPairDelay,liveInterval,previewFgMultiplier,phaseAllowance,
+                        physicalCapture&&smoothContentAnchor?contentPhaseGuard100ns:LivePairLatency::kMargin100ns)+pairExtra:legacyPairDelay;
                 std::optional<int64_t> pairPresentAnchor;
                 const auto presentAnchorFor=[&](int64_t source){
                     if(!pairPresentAnchor){
@@ -3330,6 +3351,18 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                                 options.settings.revision,batch.identity.sourceFrameId,previewFgMultiplier,!legacyContentPhase,
                                 double(admissionAnchor-liveInputReady)/10000,double(neededPhase)/10000,double(pairDelay)/10000,
                                 double(earliest-liveInputReady)/10000,double(deadline-liveInputReady)/10000,double(deadline-earliest)/10000,admitted));
+                        }
+                        if(adjustPhase&&smoothContentAnchor&&physicalCapture&&now>=nextPhaseReserveLog){
+                            nextPhaseReserveLog=now+10000000;
+                            const auto audit=pairLatency.selectionAudit();
+                            const auto base=pairDelay-pairExtra;
+                            veyra::log::info("live-phase-reserve",std::format(
+                                "revision={} source={} samples={} warming={} readinessP95Ms={:.3f} guardMs={:.3f} targetMs={:.3f} selectedBaseMs={:.3f} holdAboveTargetMs={:.3f} deadlineExtraMs={:.3f} totalPhaseMs={:.3f} limitMs={:.3f} (readiness P95 plus guard; cap, slew and admission may hold phase higher; -1 unknown)",
+                                options.settings.revision,batch.identity.sourceFrameId,audit.samples,audit.warming,
+                                audit.readinessP95<0?-1.0:double(audit.readinessP95)/10000,double(audit.guard)/10000,
+                                audit.target<0?-1.0:double(audit.target)/10000,double(base)/10000,
+                                audit.target<0?-1.0:double(std::max<int64_t>(0,base-audit.target))/10000,
+                                double(pairExtra)/10000,double(pairDelay)/10000,double(audit.limit)/10000));
                         }
                         if(adjustPhase&&!admitted&&(neededPhase>0||!legacyContentPhase))pairLatency.observe(now,neededPhase);
                         logAdmission(batch,now,deadline,elapsed,presentP95,admitted,warmingHistory,pairAnchoredLive?(isStream?"decoded-pair":"capture-pair"):"continuous");
@@ -3456,13 +3489,16 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                 if(!isImage&&GetEnvironmentVariableW(L"VEYRA_TEST_VIDEO_WORK_MS",testWork,16))std::this_thread::sleep_for(std::chrono::milliseconds(std::clamp(_wtoi(testWork),0,150)));
                 loopTrace.mark("prepare");
                 if(!presenter->beginSourceProcessing()){status(L"XeSS processing timing failed",true);break;}
+                int64_t graphCallBegin=0,graphCallEnd=0;
                 bool processed=false;{
                     processWaitBase=ring.cpuWaitCount();processWaitMsBase=ring.cpuWaitMilliseconds();processSubmitBase=ring.submitCount();
                     processingGraph=true;
                     {OnExit processingDone{[&]{processingGraph=false;}};
                     // The first checkpoint: a frame due before the graph's first one.
                     if(!historyReset)presentDuringProcess();
-                    processed=!injectedReject&&graph->process(frame,pts,historyReset,out,pkt.sequence,&pkt.colorInfo,&pkt.hardwareSurface,comparisonMode_!=0,admitFg,previewFgMultiplier,(paused_||isImage)&&transaction,presentDuringProcess,pkt.doviEl,&pkt.doviP7);}
+                    graphCallBegin=host100ns();
+                    processed=!injectedReject&&graph->process(frame,pts,historyReset,out,pkt.sequence,&pkt.colorInfo,&pkt.hardwareSurface,comparisonMode_!=0,admitFg,previewFgMultiplier,(paused_||isImage)&&transaction,presentDuringProcess,pkt.doviEl,&pkt.doviP7);
+                    graphCallEnd=host100ns();}
                     presenter->endReflex(currentReflexFrame);
                     processSlotWaitMs=ring.cpuWaitMilliseconds()-processWaitMsBase;
                 }
@@ -3679,6 +3715,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     auto watch=std::make_shared<CompletionWatch>();watch->output=out;watch->flow=frameFlow;watch->processStart=processStart;watch->real=!rereadCached;
                     watch->predictedGpuStart100ns=std::chrono::duration_cast<std::chrono::nanoseconds>(processStart.time_since_epoch()).count()/100+int64_t(queuedGpuMs*10000);
                     watch->captureArrival=captureArrival;watch->presentationGeneration=jobGeneration;
+                    watch->graphCallBegin=graphCallBegin;watch->graphCallEnd=graphCallEnd;watch->watchRegistered=host100ns();
                     // Learn enough phase for early content-clock deadlines on late capture slots.
                     watch->phaseAnchor=smoothContentAnchor?presentAnchorFor(out.batch.b100ns):captureArrival;
                     watch->reflexFrame=currentReflexFrame;
