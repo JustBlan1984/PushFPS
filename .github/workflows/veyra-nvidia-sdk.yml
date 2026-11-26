@@ -22,6 +22,7 @@ concurrency:
 env:
   CMAKE_BUILD_PARALLEL_LEVEL: 2
   VCPKG_MAX_CONCURRENCY: 2
+  CARGO_BUILD_JOBS: 2
   UPSTREAM_REPO: Likely7/Veyra-NRVideo
   # The runtime package (Qt, FFmpeg, the vendors' runtimes) the installer downloads. 2.2.1's has the same
   # vendor runtimes as 2.1.9's (upstream-inspect, 24 November 2026: every file under runtime\ has the same
@@ -246,7 +247,7 @@ jobs:
         run: |
           $root = "$env:DEPS\ort-dml"
           New-Item -ItemType Directory -Force "$root\ort","$root\dml" | Out-Null
-          Invoke-WebRequest https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/1.23.0 -OutFile "$env:DEPS\ort.zip"
+          Invoke-WebRequest https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/1.24.4 -OutFile "$env:DEPS\ort.zip"
           Invoke-WebRequest https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/1.15.4 -OutFile "$env:DEPS\dml.zip"
           Expand-Archive "$env:DEPS\ort.zip" "$root\ort" -Force
           Expand-Archive "$env:DEPS\dml.zip" "$root\dml" -Force
