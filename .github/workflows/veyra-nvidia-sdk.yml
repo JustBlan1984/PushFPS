@@ -357,6 +357,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & D:\sdk-tests\pair-phase-clock.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cl /nologo /std:c++20 /EHsc /W4 /I include tests/unit/FrameReadyObservationTests.cpp /Fe:D:\sdk-tests\frame-ready-observation.exe /Fo:D:\sdk-tests\frame-ready-observation.obj
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & D:\sdk-tests\frame-ready-observation.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build Veyra with current NVIDIA SDK headers and libraries
         timeout-minutes: 15

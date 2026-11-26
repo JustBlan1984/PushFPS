@@ -24,6 +24,7 @@
 #include "veyra/engine/VfgQueueBudget.h"
 #include "veyra/engine/VfgOverloadEstimate.h"
 #include "veyra/engine/LivePairLatency.h"
+#include "veyra/engine/FrameReadyObservation.h"
 #include "veyra/engine/RealtimePreviewScheduling.h"
 #include "veyra/engine/CaptureHalfRate.h"
 #include "veyra/engine/ContentDedup.h"
@@ -1443,9 +1444,10 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                 Clock::time_point jobStart{};
                 std::atomic<bool> ready=false;
                 Clock::time_point readyObserved{};
-                std::array<int64_t,pipeline::FrameBatch::Capacity> frameReadyObserved{};
+                std::array<FrameReadyObservation,pipeline::FrameBatch::Capacity> frameReadyObserved{};
             };
-            int64_t nextFgDeadlineLog=0;
+            const bool legacyReadyObservation=GetEnvironmentVariableW(L"VEYRA_TEST_LEGACY_READY_OBSERVATION",nullptr,0)>0;
+            int64_t nextFgDeadlineLog=0,nextPhaseReadinessLog=0;
             std::vector<std::shared_ptr<CompletionWatch>> pendingCompletions;
             std::shared_ptr<FrameFlowWindow> frameFlow;
             const uint64_t runSessionId=[&]{std::lock_guard lock(mutex_);return snapshot_.sessionId;}();
@@ -1487,11 +1489,24 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
             auto observeFrameReady=[&](CompletionWatch& watch,unsigned index){
                 const auto& batch=watch.output.batch;const auto& item=batch.frames[index];
                 auto& observed=watch.frameReadyObserved[index];
-                if(observed||!item.lease||!item.lease->ready())return;
-                observed=host100ns();
+                if(observed.ready100ns()||!item.lease)return;
+                // Bracket completion with time before an incomplete query and
+                // time after a completed one; never move the lower bound past
+                // a fence that may signal between the query and host sampling.
+                const auto pollStart=host100ns();
+                const bool complete=item.lease->ready();
+                const auto now=complete?host100ns():pollStart;
+                if(!observed.observe(now,complete))return;
                 if(traceSubframes||privateTrace)
-                    traceSubframe(diagnostics::TraceKind::FrameReady,batch,item,observed,1,
-                                  double(observed-host100ns(watch.processStart))/10000,"",true);
+                    traceSubframe(diagnostics::TraceKind::FrameReady,batch,item,now,1,
+                                  double(now-host100ns(watch.processStart))/10000,"",true);
+            };
+            // This pass only checks fences and records host observations. It must
+            // precede profiling/SDK bookkeeping and any potentially blocking Present.
+            const auto observePendingReady=[&]{
+                if(!physicalCapture||legacyReadyObservation)return;
+                for(auto& watch:pendingCompletions)
+                    for(unsigned i=0;i<watch->output.batch.count;++i)observeFrameReady(*watch,i);
             };
             std::optional<diagnostics::FrameFlowMetrics::ResetRecord> resetRecord;
             std::optional<diagnostics::FrameFlowMetrics::ResetRecord> lastResetRecord;
@@ -1572,11 +1587,16 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
             // object so SDK status and generated counts are consumed once.
             auto pollCompletions=[&]{
                 diagnostics::CpuStallTrace trace("completion-stall");
+                observePendingReady();
                 collectTimings();
                 for(auto it=pendingCompletions.begin();it!=pendingCompletions.end();){
                     auto& watch=**it;auto& batch=watch.output;
                     for(unsigned i=0;i<batch.batch.count;++i)observeFrameReady(watch,i);
                     if(!graph->resolveGeneration(batch)){++it;continue;}
+                    // Resolve can discover completion between polls. Capture that
+                    // upper bound immediately, before profiling and SDK bookkeeping.
+                    if(physicalCapture&&!legacyReadyObservation)
+                        for(unsigned i=0;i<batch.batch.count;++i)observeFrameReady(watch,i);
                     // The GPU may finish between the first poll and resolve.
                     // Collect its timestamps before removing this watch.
                     if(!watch.gpuExecutionMs)collectTimings();
@@ -1626,15 +1646,31 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                     if(adaptiveCapturePhase&&watch.phaseAnchor>0&&phaseSample&&
                        !batch.historyReset&&!batch.fgRecovery&&!costSettling&&!batch.fgFast&&
                        batch.batch.identity.settingsRevision==fgBudgetRevision&&watch.presentationGeneration==presentationGeneration.load()){
-                        int64_t requiredDelay=0;
+                        int64_t requiredDelay=0,generatedDelay=0,realDelay=0,maxGap=-1;
+                        unsigned fallbackFrames=0,unbracketed=0;
                         const auto observed=host100ns();
                         for(unsigned i=0;i<batch.batch.count;++i){const auto& item=batch.batch.frames[i];
                             // resolveGeneration can observe a fence after the
                             // first poll. Its current host time is a safe upper bound.
-                            const auto ready=watch.frameReadyObserved[i]?watch.frameReadyObserved[i]:observed;
-                            requiredDelay=std::max(requiredDelay,ready-watch.phaseAnchor+batch.batch.b100ns-item.pts100ns);
+                            const auto& observation=watch.frameReadyObserved[i];
+                            const auto ready=observation.ready100ns()?observation.ready100ns():observed;
+                            fallbackFrames+=!observation.ready100ns();
+                            const auto gap=observation.bracket100ns();
+                            if(gap<0)++unbracketed;else maxGap=std::max(maxGap,gap);
+                            const auto need=std::max<int64_t>(0,ready-watch.phaseAnchor+batch.batch.b100ns-item.pts100ns);
+                            requiredDelay=std::max(requiredDelay,need);
+                            if(item.kind==pipeline::FrameKind::Generated)generatedDelay=std::max(generatedDelay,need);
+                            else realDelay=std::max(realDelay,need);
                         }
                         if(requiredDelay>0||!legacyContentPhase)pairLatency.observe(observed,requiredDelay);
+                        if(physicalCapture&&observed>=nextPhaseReadinessLog){
+                            nextPhaseReadinessLog=observed+10000000;
+                            veyra::log::info("live-phase-readiness",std::format(
+                                "revision={} source={} earlyObservation={} requiredPhaseMs={:.3f} generatedPhaseMs={:.3f} realPhaseMs={:.3f} maxPollBracketMs={:.3f} unbracketed={} fallbackFrames={} (CPU fence upper bounds; bracket is uncertainty, not measured GPU latency; -1 unknown)",
+                                batch.batch.identity.settingsRevision,batch.batch.identity.sourceFrameId,!legacyReadyObservation,
+                                double(requiredDelay)/10000,double(generatedDelay)/10000,double(realDelay)/10000,
+                                maxGap<0?-1.0:double(maxGap)/10000,unbracketed,fallbackFrames));
+                        }
                     }
                     completeReset(batch.batch.identity);
                     watch.readyObserved=Clock::now();
@@ -1711,6 +1747,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
             // The step checks its own fence; it does not need the poll.
             auto advanceLive=[&]{applyPresentation();if(liveScheduler){
                 const auto halted=[&]{return stop_||(paused_&&!seekPreviewPending)||seekSeconds_>=0;};
+                observePendingReady();
                 if(!halted()&&preciseDeadlines&&liveScheduler->preciseWake()){const auto now=host100ns(),due=liveScheduler->wakeAt();if(due>0&&due<=now)liveScheduler->advance(now);}
                 pollCompletions();if(halted()){liveScheduler->cancel();cadence.reset();}else liveScheduler->advance(host100ns());}};
             FrameFlowWindow* waitingFlow=nullptr;uint64_t waitingPresented=0;size_t waitingPending=0;
@@ -3743,7 +3780,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                             }
                             if(generated&&isCapture&&decisionTime>=nextFgDeadlineLog){
                                 nextFgDeadlineLog=decisionTime+10000000;
-                                const auto ready=watch->frameReadyObserved[s.next];
+                                const auto ready=watch->frameReadyObserved[s.next].ready100ns();
                                 veyra::log::info("fg-deadline",std::format("revision={} batch={} subframe={} expired={} readyObservedLateMs={:.3f} decisionLateMs={:.3f} observedReadyToDecisionMs={:.3f} batchReady={} (CPU fence observations, not scanout; -1 means readiness unknown)",item.identity.settingsRevision,batch.batch.batchId,item.subframe,generationExpired,ready?double(ready-timeline.deadline(item.pts100ns))/10000:-1,double(decisionTime-timeline.deadline(item.pts100ns))/10000,ready?double(decisionTime-ready)/10000:-1,watch->ready.load()));
                                 veyra::log::info("fg-drops",std::format("revision={} deadline={} capacity={} cap={} graceMs={:.1f} (session totals of frames dropped before Present, by reason)",item.identity.settingsRevision,generatedDropDeadline,generatedDropCapacity,generatedDropCap,double(generatedGrace)/10000));
                             }
@@ -3894,11 +3931,11 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                                 }
                                 cadence.submitted(optionalNow);
                                 cadence.rateSubmitted(optionalNow,capInterval);
-                                if(physicalCapture&&veyra::log::verboseFrameLogs())veyra::log::info("capture-present-sample",std::format("source={} epoch={} revision={} batch={} subframe={} generated={} arrival={} arrivalA={} ready={} begin={} end={}",item.identity.sourceFrameId,item.identity.epoch,item.identity.settingsRevision,batch.batch.batchId,item.subframe,generated,captureArrival,lineage?lineage->a.host100ns:0,watch->frameReadyObserved[s.next],optionalNow,host100ns()));
-                                if(veyra::log::verboseFrameLogs())veyra::log::info("pacing-sample",std::format("mode={} enabled={} sync={} pts={} begin={} end={} ready={} process={} generated={} queue={} lateMs={:.3f} arrival={} deadlinePaced={} duringProcess={}",unsigned(presentationEffective.mode),presentationEffective.enabled,unsigned(presentationEffective.display),item.pts100ns,optionalNow,host100ns(),watch->frameReadyObserved[s.next],std::chrono::duration_cast<std::chrono::nanoseconds>(watch->processStart.time_since_epoch()).count()/100,generated,liveScheduler->occupancy(),isCapture?(timeline.paced()?double(optionalNow-timeline.deadline(item.pts100ns))/10000:0):fileAwaitingVideo?0:nowMs()-itemPtsMs,captureArrival,!isCapture||timeline.paced(),processingGraph));
+                                if(physicalCapture&&veyra::log::verboseFrameLogs())veyra::log::info("capture-present-sample",std::format("source={} epoch={} revision={} batch={} subframe={} generated={} arrival={} arrivalA={} ready={} begin={} end={}",item.identity.sourceFrameId,item.identity.epoch,item.identity.settingsRevision,batch.batch.batchId,item.subframe,generated,captureArrival,lineage?lineage->a.host100ns:0,watch->frameReadyObserved[s.next].ready100ns(),optionalNow,host100ns()));
+                                if(veyra::log::verboseFrameLogs())veyra::log::info("pacing-sample",std::format("mode={} enabled={} sync={} pts={} begin={} end={} ready={} process={} generated={} queue={} lateMs={:.3f} arrival={} deadlinePaced={} duringProcess={}",unsigned(presentationEffective.mode),presentationEffective.enabled,unsigned(presentationEffective.display),item.pts100ns,optionalNow,host100ns(),watch->frameReadyObserved[s.next].ready100ns(),std::chrono::duration_cast<std::chrono::nanoseconds>(watch->processStart.time_since_epoch()).count()/100,generated,liveScheduler->occupancy(),isCapture?(timeline.paced()?double(optionalNow-timeline.deadline(item.pts100ns))/10000:0):fileAwaitingVideo?0:nowMs()-itemPtsMs,captureArrival,!isCapture||timeline.paced(),processingGraph));
                                 diagnostics::FrameTraceEvent event{presentEndHost,runSessionId,item.identity,batch.batch.batchId,item.lease->consumerFence,item.pts100ns,diagnostics::TraceKind::Present,item.subframe,1,elapsed};
                                 event.decodedHost=baselineReady;event.processHost=std::chrono::duration_cast<std::chrono::nanoseconds>(watch->processStart.time_since_epoch()).count()/100;
-                                event.readyHost=watch->frameReadyObserved[s.next];event.presentBeginHost=presentBeginHost;event.presentEndHost=presentEndHost;
+                                event.readyHost=watch->frameReadyObserved[s.next].ready100ns();event.presentBeginHost=presentBeginHost;event.presentEndHost=presentEndHost;
                                 event.entryDeviationMs=entryDeviation;event.returnDeviationMs=returnDeviation;event.queueDepth=unsigned(liveScheduler->occupancy());event.mediaDeviationValid=deviationValid;
                                 if(privateTrace){
                                     event.frameKind=frameTraceKind(item.kind);event.arrivalHost=sourceArrivalHost;
@@ -3958,7 +3995,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                                 const auto returned=presentEndHost;
                                 flow->latency(captureArrival,returned);
                                 const double age=double(returned-captureArrival)/10000;
-                                if(physicalCapture&&age>=80.0)veyra::log::info("capture-age-stall",std::format("source={} epoch={} revision={} callbackToReturnMs={:.3f} readyObservedAgeMs={:.3f} gpuSpanMs={:.3f} deadlineAgeMs={:.3f} decisionLateMs={:.3f} deadlineWaitMs={:.3f} presentMs={:.3f} (CPU observation includes scheduling; not scanout; -1 means unknown or no paced deadline)",item.identity.sourceFrameId,item.identity.epoch,item.identity.settingsRevision,age,watch->frameReadyObserved[s.next]?double(watch->frameReadyObserved[s.next]-captureArrival)/10000:-1.0,watch->gpuExecutionMs.value_or(-1.0),timeline.paced()?double(timeline.deadline(item.pts100ns)-captureArrival)/10000:-1.0,timeline.paced()?double(optionalNow-timeline.deadline(item.pts100ns))/10000:-1.0,waited,elapsed));
+                                if(physicalCapture&&age>=80.0)veyra::log::info("capture-age-stall",std::format("source={} epoch={} revision={} callbackToReturnMs={:.3f} readyObservedAgeMs={:.3f} gpuSpanMs={:.3f} deadlineAgeMs={:.3f} decisionLateMs={:.3f} deadlineWaitMs={:.3f} presentMs={:.3f} (CPU observation includes scheduling; not scanout; -1 means unknown or no paced deadline)",item.identity.sourceFrameId,item.identity.epoch,item.identity.settingsRevision,age,watch->frameReadyObserved[s.next].ready100ns()?double(watch->frameReadyObserved[s.next].ready100ns()-captureArrival)/10000:-1.0,watch->gpuExecutionMs.value_or(-1.0),timeline.paced()?double(timeline.deadline(item.pts100ns)-captureArrival)/10000:-1.0,timeline.paced()?double(optionalNow-timeline.deadline(item.pts100ns))/10000:-1.0,waited,elapsed));
                             }
                             if(didPresent&&!generated&&!rereadCached&&!paused_){
                                 const auto stamp=host100ns();const auto stats=flow->snapshot(stamp,false);
@@ -3977,7 +4014,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                             // first looked at after its deadline (the thread was busy) says
                             // nothing about the GPU. Warmup and recovery pairs are not steady.
                             if(didPresent&&generated&&marginPair&&flow==frameFlow&&timeline.paced()&&!batch.historyReset&&!batch.fgRecovery){
-                                const auto deadline=timeline.deadline(item.pts100ns),ready=watch->frameReadyObserved[s.next];
+                                const auto deadline=timeline.deadline(item.pts100ns),ready=watch->frameReadyObserved[s.next].ready100ns();
                                 if(ready>0&&(ready<=deadline||s.seenUnfinished[s.next]))deadlineMargin.observe(host100ns(),deadline,ready,pairExtra);
                             }
                             if(didPresent){++s.handled;++s.count;flow->presented(generated,item.lease->consumerFence,presentEndHost,async?async->call100ns:presenter->lastPresentCallHost100ns());if(!generated)++presentationCompletedReal;s.ageMs=double(presentEndHost-captureArrival)/10000;
