@@ -1,3 +1,4 @@
+#include "veyra/engine/DeadlineWait.h"
 #include <type_traits>
 #include "veyra/engine/VideoPresenter.h"
 #include <type_traits>
@@ -869,7 +870,7 @@ std::shared_ptr<VideoPresenter::AsyncPresentation> VideoPresenter::queueNativePr
             if(!capacityUntil)capacityUntil=now+capacityBudget;
             if(generated&&now>=capacityUntil){state->success=true;return;}
             if(now>expiry+20000000)return;
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            {std::lock_guard capacityLock(presentationMutex_);sink_.waitPresentationReady(1);}
         }
         std::lock_guard lock(presentationMutex_);
         if(state->ticket->cancelled.load()||(valid&&!valid()))return;
@@ -887,7 +888,13 @@ std::shared_ptr<VideoPresenter::AsyncPresentation> VideoPresenter::queueNativePr
             veyra::log::info("native-present-worker",std::format("source={} generated={} hdr={} deadlineLateMs={:.3f} presentMs={:.3f} submitted={} (one leased ready frame; CPU Present timing, not scanout)",
                 identity.sourceFrameId,generated,snapshot->hdrOutput(),double(state->begin100ns-deadline)/10000,double(state->end100ns-state->begin100ns)/10000,state->submitted));
         }
-    },valid,state->ticket);
+    },valid,state->ticket,[](int64_t due,const NativePresentWorker::Handle& ticket){
+        // Use the engine's existing high-resolution timer and bounded precise
+        // tail. Generic std::condition_variable timing is only the CPU-test fallback.
+        thread_local DeadlineWait wait;
+        while(!ticket->cancelled.load()&&DeadlineWait::now100ns()<due)
+            wait.until(due,nullptr,nullptr,[&]{return ticket->cancelled.load();});
+    });
     if(!accepted)return {};
     return state;
 }
