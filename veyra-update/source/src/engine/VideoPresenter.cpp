@@ -1,3 +1,4 @@
+#include <avrt.h>
 #include "veyra/engine/DeadlineWait.h"
 #include <type_traits>
 #include "veyra/engine/VideoPresenter.h"
@@ -891,6 +892,16 @@ std::shared_ptr<VideoPresenter::AsyncPresentation> VideoPresenter::queueNativePr
     },valid,state->ticket,[](int64_t due,const NativePresentWorker::Handle& ticket){
         // Use the engine's existing high-resolution timer and bounded precise
         // tail. Generic std::condition_variable timing is only the CPU-test fallback.
+        struct ThreadScheduling {
+            HANDLE mmcss=nullptr;
+            ThreadScheduling(){
+                SetThreadDescription(GetCurrentThread(),L"Veyra native presentation");
+                DWORD index=0;mmcss=AvSetMmThreadCharacteristicsW(L"Pro Audio",&index);
+                if(!mmcss)veyra::log::warn("native-present-worker",std::format("MMCSS unavailable error={}",GetLastError()));
+            }
+            ~ThreadScheduling(){if(mmcss)AvRevertMmThreadCharacteristics(mmcss);}
+        };
+        thread_local ThreadScheduling scheduling;
         thread_local DeadlineWait wait;
         while(!ticket->cancelled.load()&&DeadlineWait::now100ns()<due)
             wait.until(due,nullptr,nullptr,[&]{return ticket->cancelled.load();});
