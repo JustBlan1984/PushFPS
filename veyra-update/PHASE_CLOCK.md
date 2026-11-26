@@ -14,3 +14,5 @@ The new live-phase-clock diagnostic reports the predicted readiness bound, actua
 Baseline in the user's Medium 2X/HDR/uncapped race: approximately 60 submitted FPS and 27.6 ms representative reported P95 capture-callback-to-Present-return latency over 94 seconds, no added capture drops/expired generated frames/errors in that sample.
 Performance after this correction is unmeasured until the new candidate is installed and run on the user's RTX 5070 Ti.
 The existing installed build and settings are unchanged by CI. No backups or rollback files are created by the updater.
+
+Controlled comparison: setting VEYRA_TEST_LEGACY_CONTENT_PHASE=1 before launching selects the previous content-clock admission floor and ignores zero learning samples, while retaining the same worker, shaders, SDKs and user settings. The default uses the corrected coordinates. live-phase-clock logs alignedClock=true/false. This permits comparison within one executable without retaining backup binaries. Close the app normally before changing the launch environment; do not stop an active session automatically.

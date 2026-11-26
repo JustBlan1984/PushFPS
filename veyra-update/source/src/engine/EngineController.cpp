@@ -1409,6 +1409,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
             double vfgChosenFgMs=0,vfgFastFgMs=0;uint64_t vfgFastPairs=0,vfgFastBudgetPairs=0,vfgChosenPairs=0;int64_t vfgChosenAt=0,nextVfgFastLog=0;
             uint64_t generatedDropDeadline=0,generatedDropCapacity=0,generatedDropCap=0;
             LivePairLatency pairLatency;
+            const bool legacyContentPhase=GetEnvironmentVariableW(L"VEYRA_TEST_LEGACY_CONTENT_PHASE",nullptr,0)>0;
             // Capture-card FG pairs: automatic deadline margin (0-1 ms) on top of the phase.
             LiveDeadlineMargin deadlineMargin;
             // Capture-card FG pairs rejected for a second: real frames without the FG phase.
@@ -1633,7 +1634,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                             const auto ready=watch.frameReadyObserved[i]?watch.frameReadyObserved[i]:observed;
                             requiredDelay=std::max(requiredDelay,ready-watch.phaseAnchor+batch.batch.b100ns-item.pts100ns);
                         }
-                        pairLatency.observe(observed,requiredDelay);
+                        if(requiredDelay>0||!legacyContentPhase)pairLatency.observe(observed,requiredDelay);
                     }
                     completeReset(batch.batch.identity);
                     watch.readyObserved=Clock::now();
@@ -3265,7 +3266,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         // applied on a later content anchor counted that offset twice.
                         // The generated deadline must still cover the existing GPU
                         // readiness prediction; no source PTS or A/B spacing changes.
-                        const auto admissionAnchor=smoothContentAnchor?presentAnchorFor(batch.b100ns):liveInputReady;
+                        const auto admissionAnchor=smoothContentAnchor&&!legacyContentPhase?presentAnchorFor(batch.b100ns):liveInputReady;
                         if(pairAnchoredLive)liveTimeline.resetPair(batch.identity.epoch,batch.b100ns,admissionAnchor,pairDelay);
                         else if(!liveTimeline.anchored(batch.identity.epoch))liveTimeline.reset(batch.identity.epoch,batch.b100ns,liveInputReady,liveSourceInterval100ns(pkt.duration,activeSource->info().averageFps));
                         const auto interval=liveInterval;
@@ -3276,7 +3277,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         const auto earliest=now+fgBudget.requiredDeadlineLead(now,elapsed,presentP95,warmingHistory);
                         const bool held=vfgCostSettling.holding(now);
                         const bool adjustPhase=marginPair&&pairAnchoredLive&&!warmingHistory&&!historyReset&&!held;
-                        const auto neededPhase=smoothContentAnchor?
+                        const auto neededPhase=smoothContentAnchor&&!legacyContentPhase?
                             livePairAdmissionPhase100ns(earliest,admissionAnchor,batch.b100ns,lastGenerated,pairExtra):
                             earliest-liveInputReady+batch.b100ns-lastGenerated-pairExtra;
                         if(adjustPhase){
@@ -3288,12 +3289,12 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                         if(adjustPhase&&smoothContentAnchor&&now>=nextPairPhaseClockLog){
                             nextPairPhaseClockLog=now+10000000;
                             veyra::log::info("live-phase-clock",std::format(
-                                "revision={} source={} multiplier={} anchorOffsetMs={:.3f} neededPhaseMs={:.3f} selectedPhaseMs={:.3f} earliestReadyMs={:.3f} generatedDeadlineMs={:.3f} slackMs={:.3f} admitted={} (same anchor for admission and presentation; readiness is predicted, not scanout)",
-                                options.settings.revision,batch.identity.sourceFrameId,previewFgMultiplier,
+                                "revision={} source={} multiplier={} alignedClock={} anchorOffsetMs={:.3f} neededPhaseMs={:.3f} selectedPhaseMs={:.3f} earliestReadyMs={:.3f} generatedDeadlineMs={:.3f} slackMs={:.3f} admitted={} (same anchor for admission and presentation; readiness is predicted, not scanout)",
+                                options.settings.revision,batch.identity.sourceFrameId,previewFgMultiplier,!legacyContentPhase,
                                 double(admissionAnchor-liveInputReady)/10000,double(neededPhase)/10000,double(pairDelay)/10000,
                                 double(earliest-liveInputReady)/10000,double(deadline-liveInputReady)/10000,double(deadline-earliest)/10000,admitted));
                         }
-                        if(adjustPhase&&!admitted)pairLatency.observe(now,neededPhase);
+                        if(adjustPhase&&!admitted&&(neededPhase>0||!legacyContentPhase))pairLatency.observe(now,neededPhase);
                         logAdmission(batch,now,deadline,elapsed,presentP95,admitted,warmingHistory,pairAnchoredLive?(isStream?"decoded-pair":"capture-pair"):"continuous");
                         auto decision=admitted?pipeline::EnhanceGraph::FgDecision::Evaluate:pipeline::EnhanceGraph::FgDecision::Skip;
                         if(smoothTransportAnchor&&options.settings.vfgAutoRegulate&&previewFgMultiplier==2&&!warmingHistory&&graph->vfgFastReady()){
