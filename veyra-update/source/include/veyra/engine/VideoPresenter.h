@@ -56,6 +56,7 @@ public:
         int64_t begin100ns=0,end100ns=0,call100ns=0;
     };
     bool canAsyncPresent() const;
+    std::unique_lock<std::recursive_mutex> tryPresentationAccess(){return std::unique_lock<std::recursive_mutex>(presentationMutex_,std::try_to_lock);}
     std::shared_ptr<AsyncPresentation> queueNativePresent(
         gfx::D3D12DeviceContext&,gfx::CommandSlotRing&,pipeline::EnhanceGraph&,
         std::shared_ptr<pipeline::FrameLease>,bool generated,bool referencesValid,

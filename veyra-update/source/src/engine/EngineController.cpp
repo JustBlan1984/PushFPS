@@ -1745,6 +1745,9 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
             // result swung between runs (DLSS 2X 1% low 113-118). The single owner thread
             // cannot do both; a frame due here goes out at the next checkpoint.
             auto presentDuringProcess=[&]{
+                // A checkpoint must never stall enhancement behind a worker's DXGI call.
+                auto access=presenter->tryPresentationAccess();
+                if(!access.owns_lock())return;
                 if(!checkpointPresentation||!isCapture||!options.fg||(graph->hdrOutput()&&(!physicalCapture||presentationEffective.outputRate==OutputRateMode::Custom||!presenter->canAsyncPresent()))||!presenter->independentQueue()||
                    !liveScheduler||stop_||(paused_&&!seekPreviewPending)||seekSeconds_>=0)return;
                 const auto due=liveScheduler->wakeAt(),now=host100ns();
