@@ -1,7 +1,7 @@
-#include <avrt.h>
-#include "veyra/engine/DeadlineWait.h"
-#include <type_traits>
 #include "veyra/engine/VideoPresenter.h"
+#include "veyra/engine/DeadlineWait.h"
+#include <avrt.h>
+#include <type_traits>
 #include <type_traits>
 #include <utility>
 #include "veyra/engine/DoviCurveAdapter.h" // custom: Dolby Vision level 1 -> curve
