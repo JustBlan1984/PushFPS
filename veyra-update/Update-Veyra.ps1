@@ -92,7 +92,8 @@ try {
             if (Test-Path -LiteralPath $file.next) { Remove-Item -LiteralPath $file.next -Force }
         }
     }
-    Write-Host 'Veyra updated: DLSS 310.9.16 and Video Codec SDK 13.1.15.'
+    Write-Host ("Veyra updated: " + $manifest.version)
+    Write-Host ("NVIDIA components: DLSS " + $manifest.dlssSdk + "; Video Codec SDK " + $manifest.videoCodecSdk)
     Write-Host 'No backups or rollback files were created. Settings, VFG, patched FFmpeg and driver were preserved.'
 
 } finally {
