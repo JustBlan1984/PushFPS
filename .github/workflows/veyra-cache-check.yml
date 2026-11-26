@@ -1,0 +1,65 @@
+name: Veyra compiler cache verification
+on:
+  push:
+    branches: ['veyra/build-cache', 'veyra/2.2.1-engine-opt']
+    paths:
+      - '.github/workflows/veyra-cache-check.yml'
+      - '.github/workflows/veyra-nvidia-sdk.yml'
+      - 'veyra-update/cache/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  SCCACHE_GHA_ENABLED: 'true'
+  SCCACHE_GHA_VERSION: veyra-msvc-v1
+jobs:
+  populate:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    outputs:
+      compiler: ${{ steps.probe.outputs.compiler }}
+      object: ${{ steps.probe.outputs.object }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install compiler cache
+        uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.20.1
+      - name: Compile through the real CMake launcher
+        id: probe
+        shell: pwsh
+        run: ./veyra-update/cache/Test-CompilerCache.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Veyra-compiler-cache-populate
+          path: compiler-cache-proof.txt
+  reuse:
+    needs: populate
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install compiler cache
+        uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.20.1
+      - name: Require a cache hit on a fresh runner
+        shell: pwsh
+        env:
+          EXPECTED_COMPILER: ${{ needs.populate.outputs.compiler }}
+          EXPECTED_OBJECT: ${{ needs.populate.outputs.object }}
+        run: ./veyra-update/cache/Test-CompilerCache.ps1 -RequireHit -ExpectedCompiler $env:EXPECTED_COMPILER -ExpectedObject $env:EXPECTED_OBJECT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Veyra-compiler-cache-reuse-proof
+          path: compiler-cache-proof.txt

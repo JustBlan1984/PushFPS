@@ -20,9 +20,18 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  SCCACHE_GHA_ENABLED: 'true'
+  SCCACHE_GHA_VERSION: veyra-msvc-v1
+  CMAKE_C_COMPILER_LAUNCHER: sccache
+  CMAKE_CXX_COMPILER_LAUNCHER: sccache
   CMAKE_BUILD_PARALLEL_LEVEL: 2
   VCPKG_MAX_CONCURRENCY: 2
   CARGO_BUILD_JOBS: 2
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_GHA_VERSION: "veyra-msvc-v1"
+  SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+  CMAKE_C_COMPILER_LAUNCHER: sccache
+  CMAKE_CXX_COMPILER_LAUNCHER: sccache
   UPSTREAM_REPO: Likely7/Veyra-NRVideo
   # The runtime package (Qt, FFmpeg, the vendors' runtimes) the installer downloads. 2.2.1's has the same
   # vendor runtimes as 2.1.9's (upstream-inspect, 24 November 2026: every file under runtime\ has the same
@@ -83,6 +92,26 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+
+
+      - name: Install compiler cache
+        id: sccache
+        uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.20.1
+
+      - name: Identify compiler and dependency recipe for cache keys
+        run: |
+          $compiler = (Get-Command cl.exe).Source
+          $compilerHash = (Get-FileHash -LiteralPath $compiler -Algorithm SHA256).Hash.ToLowerInvariant()
+          $sdk = $env:UCRTVersion -replace '[^0-9.]',''
+          if (-not $sdk) { $sdk = 'unknown-sdk' }
+          "MSVC_CACHE_ID=$($compilerHash.Substring(0,16))-$sdk" | Out-File -Append $env:GITHUB_ENV
+          $recipe = Join-Path $env:GITHUB_WORKSPACE '_update\.github\workflows\veyra-nvidia-sdk.yml'
+          $recipeHash = (Get-FileHash -LiteralPath $recipe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "VCPKG_RECIPE_HASH=$($recipeHash.Substring(0,16))" | Out-File -Append $env:GITHUB_ENV
+          sccache --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Qt 6.8.3 (MSVC 2022 x64)
         uses: jurplel/install-qt-action@v4
@@ -157,8 +186,10 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: D:\deps\vcpkg-binary
-          key: vcpkg-bin-${{ env.VCPKG_COMMIT }}-v2-${{ github.run_id }}
-          restore-keys: vcpkg-bin-${{ env.VCPKG_COMMIT }}-v2-
+          key: vcpkg-bin-${{ env.VCPKG_COMMIT }}-v3-${{ env.MSVC_CACHE_ID }}-${{ env.VCPKG_RECIPE_HASH }}
+          restore-keys: |
+            vcpkg-bin-${{ env.VCPKG_COMMIT }}-v3-${{ env.MSVC_CACHE_ID }}-
+            vcpkg-bin-${{ env.VCPKG_COMMIT }}-v2-
 
       - name: FFmpeg 9.0.1 (vcpkg at the pinned baseline)
         working-directory: D:\deps
@@ -185,11 +216,11 @@ jobs:
           Get-ChildItem "$env:DEPS\stream-installed\x64-windows-static\lib" -Filter *.lib | Format-Table Name, Length
 
       - name: Save vcpkg binaries
-        if: always() && steps.vcpkg-cache.outcome == 'success'
+        if: always() && steps.vcpkg-cache.outcome == 'success' && steps.vcpkg-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: D:\deps\vcpkg-binary
-          key: vcpkg-bin-${{ env.VCPKG_COMMIT }}-v2-${{ github.run_id }}
+          key: vcpkg-bin-${{ env.VCPKG_COMMIT }}-v3-${{ env.MSVC_CACHE_ID }}-${{ env.VCPKG_RECIPE_HASH }}
 
       - name: Streaming sources (Chiaki-ng with Veyra's patches, moonlight-common-c)
         working-directory: D:\deps
@@ -292,6 +323,7 @@ jobs:
           if (-not $env:LIBDOVI_ROOT) { throw 'Full Veyra requires libdovi.' }
           $dovi = @('-DVEYRA_ENABLE_LIBDOVI=ON', "-DVEYRA_LIBDOVI_ROOT=$env:LIBDOVI_ROOT")
           cmake -S . -B $env:BUILD -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
             "-DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR;$ffmpeg;$stream" `
             -DVEYRA_BUILD_QML_UI=ON -DVEYRA_ENABLE_EXPERIMENTAL_DLSSNR=ON -DVEYRA_ENABLE_D3D12_DEBUG=OFF `
             -DVEYRA_ENABLE_REMOTEPLAY=ON -DVEYRA_ENABLE_MOONLIGHT=ON -DVEYRA_ENABLE_XBOX=ON `
@@ -330,6 +362,8 @@ jobs:
       - name: Build Veyra with current NVIDIA SDK headers and libraries
         timeout-minutes: 15
         run: |
+          sccache --zero-stats
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build $env:BUILD --target veyra_qml_ui --parallel 2
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $exe = Get-ChildItem $env:BUILD -Recurse -Filter veyra_qml_ui.exe | Select-Object -First 1
@@ -461,6 +495,21 @@ jobs:
           if (Test-Path "$testRoot\sdk-backups") { throw 'Unexpected backup folder' }
           if (@(Get-ChildItem $testRoot -Recurse -File | Where-Object Name -like '*.sdk-update-*').Count) { throw 'Temporary replacement files remain' }
           Write-Host 'Updater replacement, signature/hash verification, settings preservation and no-backup checks PASS. GPU execution was not tested.'
+
+
+      - name: Report actual compiler cache statistics
+        if: always() && steps.sccache.outcome == 'success'
+        run: |
+          sccache --show-stats | Tee-Object -FilePath "$env:GITHUB_WORKSPACE\compiler-cache-stats.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Save compiler cache statistics
+        if: always() && steps.sccache.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Veyra-compiler-cache-statistics
+          path: compiler-cache-stats.txt
+          if-no-files-found: warn
 
       - uses: actions/upload-artifact@v4
         with:
