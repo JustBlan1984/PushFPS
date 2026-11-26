@@ -21,7 +21,12 @@ int main(){
     assert(nrDecodeTailMs(100,400,1000,110,400,1000)==0.0);
     assert(!nrDecodeTailMs(100,400,0,110,350,0));
     assert(!nrDecodeTailMs(100,400,1000,110,350,2000));
-    assert(!nrDecodeTailMs(100,400,1000,90,350,1000));
+    // Production NVIDIA order: NR begin, layer begin, NR end, layer end.
+    assert(nrDecodeTailMs(100,400,1000,90,350,1000)==50.0);
+    assert(nrDecodeTailMs(101,400,1000,100,350,1000)==50.0);
+    assert(!nrDecodeTailMs(100,400,1000,80,90,1000)); // disjoint spans
+    assert(!nrDecodeTailMs(400,100,1000,110,350,1000)); // reversed layer
+    assert(!nrDecodeTailMs(100,400,1000,350,110,1000)); // reversed evaluate
     assert(!nrDecodeTailMs(100,400,1000,110,450,1000));
     auto key=Cache::Inputs::make(1920,1080,0,1.f,.75f,1.f,.75f,1,0);
     Cache c,secondLayer;Parameters p;

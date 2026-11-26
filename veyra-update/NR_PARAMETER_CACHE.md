@@ -19,3 +19,6 @@ Shader fusion is deferred until the measured conversion cost justifies it and ha
 CPU tests exercise all scalar key fields, typed 21-key payload, float bit identity, separate layers, failed-evaluation retry, invalidation, disabled/probe baseline, and missing/mismatched GPU timestamp ranges.
 CI also builds the app and runs the existing engine checks, private startup and updater fixture. They do not prove actual RTX NR image equivalence, runtime mutation behavior, gameplay latency or HDR quality.
 Existing SDKs/DLLs/models/driver/settings are preserved. Inactive NVIDIA Original NR 310.8.0 is not replaced by this candidate. No backups or rollback binaries are created.
+
+## Decode timing correction
+The engine-opt.22 diagnostic assumed layer-begin preceded NR-begin. NVIDIA records NR-begin first, then layer-begin, then NR-end and layer-end, so that check rejected valid samples as unavailable. The corrected helper accepts either start ordering when NR-end lies inside the layer span, while rejecting disjoint/reversed spans, zero or mismatched frequencies. Regression tests now cover the actual NVIDIA marker order. This is a telemetry correction only: shaders, NR cache behavior, runtime, settings and presentation policy are unchanged. No performance improvement is claimed from this correction.
