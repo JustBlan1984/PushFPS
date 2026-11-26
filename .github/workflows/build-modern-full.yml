@@ -26,9 +26,11 @@ permissions:
 # group, and a cancelled push run makes the README build badge read "failing".
 concurrency:
   group: build-windows-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
+  CMAKE_BUILD_PARALLEL_LEVEL: 2
+  VCPKG_MAX_CONCURRENCY: 2
   UPSTREAM_REPO: Likely7/Veyra-NRVideo
   # The runtime package (Qt, FFmpeg, the vendors' runtimes) the installer downloads. 2.2.1's has the same
   # vendor runtimes as 2.1.9's (upstream-inspect, 24 November 2026: every file under runtime\ has the same
