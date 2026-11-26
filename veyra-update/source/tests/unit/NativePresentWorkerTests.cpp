@@ -10,7 +10,7 @@ int main(){
     auto cancelled=worker.submit(now100ns()+2000000,[&]{++calls;},[]{return true;});
     assert(cancelled);cancelled->cancel();cancelled->wait();assert(calls==0);
     auto invalid=worker.submit(now100ns(),[&]{++calls;},[]{return false;});
-    assert(invalid);invalid->wait();assert(calls==0);
+    assert(invalid);invalid->wait();assert(calls==0&&!invalid->executed.load());
     std::promise<void> entered,release;auto released=release.get_future().share();
     auto running=worker.submit(now100ns(),[&]{entered.set_value();released.wait();++calls;},[]{return true;});
     assert(entered.get_future().wait_for(std::chrono::seconds(2))==std::future_status::ready);
@@ -19,7 +19,7 @@ int main(){
     auto resource=std::make_shared<int>(7);std::weak_ptr<int> weak=resource;
     auto lifetime=worker.submit(now100ns(),[pin=resource]{assert(*pin==7);},[]{return true;});
     resource.reset();lifetime->wait();assert(weak.expired()); // captures released before done
-    auto failure=worker.submit(now100ns(),[]{throw 42;},[]{return true;});failure->wait();
+    auto failure=worker.submit(now100ns(),[]{throw 42;},[]{return true;});failure->wait();assert(failure->executed.load());
     for(unsigned i=0;i<100;++i){auto t=worker.submit(now100ns(),[&]{++calls;},[]{return true;});assert(t);t->wait();}
     assert(calls==101);
     const auto due=now100ns()+100000;std::atomic<int64_t> called{0};

@@ -3753,8 +3753,8 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                                     comparisonMode_,comparisonBase_,comparisonSplit_,item.identity,previewView(),item.pts100ns,
                                     timeline.deadline(item.pts100ns),timeline.deadline(item.pts100ns)+generatedGrace,int64_t(capacityBudget*10000),
                                     watch->reflexFrame,hdrCoverageObserved_.load(),
-                                    [this,&presentationGeneration,jobGeneration]{
-                                        return !stop_&&!paused_&&seekSeconds_<0&&presentationGeneration.load()==jobGeneration;
+                                    [this,&presentationGeneration,jobGeneration,generated]{
+                                        return !stop_&&!paused_&&seekSeconds_<0&&presentationGeneration.load()==jobGeneration&&(!generated||comparisonMode_==0);
                                     });
                                 if(s.async)return {State::Pending,host100ns()+2000};
                             }
@@ -3835,7 +3835,14 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                             if(async){
                                 if(!presenter->finishNativePresent(async,*graph))return {State::Failed};
                                 didPresent=async->submitted;
-                                if(!didPresent&&generated){++generatedDropDeadline;++s.dropped;}
+                                if(!didPresent){
+                                    ++s.handled;
+                                    if(generated){
+                                        if(async->capacityExpired){++generatedDropCapacity;++s.dropped;}
+                                        else if(async->deadlineExpired){++generatedDropDeadline;++s.dropped;}
+                                        else ++presentationSkippedGenerated;
+                                    }
+                                }
                             }else{
                                 presenter->reflexFrame(watch->reflexFrame);
                                 presenter->observeHdrCoverage(hdrCoverageObserved_.load());
@@ -3965,7 +3972,7 @@ void EngineController::run(HWND window,std::wstring path,PlayerOptions options,s
                                 if(ready>0&&(ready<=deadline||s.seenUnfinished[s.next]))deadlineMargin.observe(host100ns(),deadline,ready,pairExtra);
                             }
                             if(didPresent){++s.handled;++s.count;flow->presented(generated,item.lease->consumerFence,presentEndHost,async?async->call100ns:presenter->lastPresentCallHost100ns());if(!generated)++presentationCompletedReal;s.ageMs=double(presentEndHost-captureArrival)/10000;
-                                if(flow==frameFlow){const auto time=host100ns();liveSubmissions.push_back(time);while(liveSubmissions.size()>1&&time-liveSubmissions.front()>10000000)liveSubmissions.pop_front();}}
+                                if(flow==frameFlow){const auto time=presentEndHost;liveSubmissions.push_back(time);while(liveSubmissions.size()>1&&time-liveSubmissions.front()>10000000)liveSubmissions.pop_front();}}
                             ++s.next;
                         }
                         return {State::Complete};

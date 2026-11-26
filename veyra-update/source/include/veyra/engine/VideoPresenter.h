@@ -51,7 +51,7 @@ public:
         NativePresentWorker::Handle ticket;
         std::shared_ptr<pipeline::FrameLease> lease;
         Microsoft::WRL::ComPtr<ID3D12Fence> fence;
-        bool success=false,submitted=false;
+        bool success=false,submitted=false,capacityExpired=false,deadlineExpired=false;
         uint64_t consumerFence=0;
         int64_t begin100ns=0,end100ns=0,call100ns=0;
     };

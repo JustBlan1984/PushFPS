@@ -863,12 +863,12 @@ std::shared_ptr<VideoPresenter::AsyncPresentation> VideoPresenter::queueNativePr
         int64_t capacityUntil=0;
         while(true){
             if(state->ticket->cancelled.load()||(valid&&!valid()))return;
-            if(generated&&nativeHost100ns()>expiry){state->success=true;return;}
+            if(generated&&nativeHost100ns()>expiry){state->success=true;state->deadlineExpired=true;return;}
             bool ready;{std::lock_guard lock(presentationMutex_);ready=sink_.presentationReady();}
             if(ready)break;
             const auto now=nativeHost100ns();
             if(!capacityUntil)capacityUntil=now+capacityBudget;
-            if(generated&&now>=capacityUntil){state->success=true;return;}
+            if(generated&&now>=capacityUntil){state->success=true;state->capacityExpired=true;return;}
             if(now>expiry+20000000)return;
             {std::lock_guard capacityLock(presentationMutex_);sink_.waitPresentationReady(1);}
         }
@@ -907,7 +907,7 @@ bool VideoPresenter::finishNativePresent(const std::shared_ptr<AsyncPresentation
         state->lease->consumerFence=state->consumerFence;
         graph.presentationSubmitted(state->lease->slot,state->fence.Get(),state->consumerFence);
     }
-    return state->success;
+    return state->success||!state->ticket->executed.load();
 }
 bool VideoPresenter::readPresentedFrameForTest(gfx::D3D12DeviceContext& ctx,gfx::CommandSlotRing& ring,sink::RgbaImage& image){
     std::lock_guard presenterLock(presentationMutex_);

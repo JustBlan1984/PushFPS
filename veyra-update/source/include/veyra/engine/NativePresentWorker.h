@@ -14,7 +14,7 @@ namespace veyra::engine {
 class NativePresentWorker {
 public:
     struct Ticket {
-        std::atomic<bool> cancelled{false},done{false};
+        std::atomic<bool> cancelled{false},done{false},executed{false};
         std::mutex mutex;
         std::condition_variable cv;
         void cancel(){cancelled.store(true);cv.notify_all();}
@@ -27,8 +27,8 @@ public:
         std::lock_guard lock(mutex_);
         if(stopping_||(active_&&!active_->done.load()))return {};
         if(!ticket)ticket=std::make_shared<Ticket>();
-        active_=ticket;job_={ticket,deadline100ns,std::move(call),std::move(valid),std::move(waiter)};
         if(!thread_.joinable())thread_=std::thread([this]{run();});
+        active_=ticket;job_={ticket,deadline100ns,std::move(call),std::move(valid),std::move(waiter)};
         cv_.notify_one();return ticket;
     }
     void cancelAndWait(){
@@ -55,6 +55,7 @@ private:
             while(!job.ticket->cancelled.load()&&std::chrono::steady_clock::now()<due)std::this_thread::yield();
             }
             if(!job.ticket->cancelled.load()&&(!job.valid||job.valid())){
+                job.ticket->executed.store(true);
                 job.call();
             }
             }catch(...){/* caller's result remains unsuccessful */}
