@@ -1,0 +1,96 @@
+name: VIctory Intel 14900K and NVIDIA trial
+
+on:
+  push:
+    branches: ['victory/intel-nvidia-trial']
+    paths: ['.github/workflows/victory-nvidia.yml', 'victory-build/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: source
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TARGET_DIR: C:\vt
+      RUSTUP_TOOLCHAIN: 1.98.1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: build-scripts
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: Belobug/VIctory-Belobug-AMD
+          ref: cd8dfc06ace7ccb91a19431e74bc2d0de2a10145
+          path: source
+          persist-credentials: false
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install pinned Rust
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version
+          cargo --version
+          git rev-parse HEAD
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: source -> C:\vt
+          key: victory-intel-trial-v1
+      - name: Data-independent core, PE and game-format tests
+        timeout-minutes: 20
+        run: |
+          cargo test --locked --profile diag -p victory-core -p victory-pe -p victory-game
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Select an Intel hybrid CPU code-generation target
+        run: |
+          $targets = rustc --print target-cpus
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $cpu = @('raptorlake','alderlake','x86-64-v3') | Where-Object { $name=$_; $targets -match "^\s*$name\s" } | Select-Object -First 1
+          if (-not $cpu) { throw 'No supported Intel/AVX2 CPU code-generation target found' }
+          "RUSTFLAGS=-C target-cpu=$cpu" | Out-File -Append $env:GITHUB_ENV
+          "VICTORY_CPU_TARGET=$cpu" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "CPU target: $cpu. This build is for the user's i9-14900K, not the CI runner."
+      - name: Build diagnostic-capable optimized compatibility layer
+        timeout-minutes: 60
+        run: |
+          cargo build --locked --profile diag -p victory --features diagnostics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path 'C:\vt\diag\victory.exe')) { throw 'Compatibility executable missing' }
+      - name: Package public compatibility layer only
+        run: |
+          $root = Join-Path $env:GITHUB_WORKSPACE 'dist\VIctory-14900K-5070Ti'
+          New-Item -ItemType Directory -Force "$root\target\diag","$root\scripts" | Out-Null
+          Copy-Item C:\vt\diag\victory.exe "$root\target\diag"
+          Copy-Item scripts\play.ps1 "$root\scripts"
+          Copy-Item LICENSE,Cargo.lock,rust-toolchain.toml,victory.example.toml $root
+          Copy-Item "$env:GITHUB_WORKSPACE\build-scripts\victory-build\Start-VIctory-NVIDIA.ps1" $root
+          Copy-Item "$env:GITHUB_WORKSPACE\build-scripts\victory-build\README.txt" $root
+          @{
+            source='https://github.com/Belobug/VIctory-Belobug-AMD'
+            commit='cd8dfc06ace7ccb91a19431e74bc2d0de2a10145'
+            cpuTarget=$env:VICTORY_CPU_TARGET
+            gpuTarget='NVIDIA GeForce RTX 5070 Ti; local GPU verification pending'
+            rust=(rustc --version)
+            gameFilesIncluded=$false
+            sha256=(Get-FileHash "$root\target\diag\victory.exe").Hash
+          } | ConvertTo-Json | Set-Content "$root\build-manifest.json" -Encoding utf8
+          Compress-Archive "$root\*" "$root.zip"
+          (Get-FileHash "$root.zip").Hash | Set-Content "$root.zip.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VIctory-14900K-5070Ti-trial
+          path: |
+            dist/VIctory-14900K-5070Ti.zip
+            dist/VIctory-14900K-5070Ti.zip.sha256
+          if-no-files-found: error
