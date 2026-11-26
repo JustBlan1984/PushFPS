@@ -385,7 +385,7 @@ jobs:
         run: |
           $env:VEYRA_LOG_FILE = 'D:\veyra-startup.log'
           $env:QT_OPENGL = 'software'
-          $p = Start-Process -FilePath "$env:VEYRA_TEST_STAGE\veyra_qml_ui.exe" -WorkingDirectory $env:VEYRA_TEST_STAGE -ArgumentList @('--data-dir','D:\veyra-private-data','--no-ngx','--no-features','--exit-after','1500') -PassThru
+          $p = Start-Process -FilePath "$env:VEYRA_TEST_STAGE\veyra_qml_ui.exe" -WorkingDirectory $env:VEYRA_TEST_STAGE -ArgumentList @('--managed-portable','--data-dir','D:\veyra-private-data','--no-ngx','--no-features','--exit-after','1500') -PassThru
           if (-not $p.WaitForExit(60000)) { $p.Kill(); throw 'Startup timed out' }
           if ($p.ExitCode -ne 0) { throw "Veyra startup failed: $($p.ExitCode)" }
           $log = Get-Content D:\veyra-startup.log -Raw
