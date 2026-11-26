@@ -47,6 +47,18 @@ jobs:
         with:
           workspaces: source -> C:\vt
           key: victory-intel-trial-v1
+      - name: Apply reviewed local presentation patch
+        run: |
+          git apply --check "$env:GITHUB_WORKSPACE\build-scripts\victory-build\fullscreen.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git apply "$env:GITHUB_WORKSPACE\build-scripts\victory-build\fullscreen.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test aspect-fit geometry on CI CPU
+        run: |
+          rustc --edition 2024 --test crates/victory-gpu/src/host/fullscreen/geometry.rs -o "$env:RUNNER_TEMP\aspect-tests.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:RUNNER_TEMP\aspect-tests.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Data-independent core, PE and game-format tests
         timeout-minutes: 20
         run: |
@@ -76,11 +88,15 @@ jobs:
           Copy-Item LICENSE,Cargo.lock,rust-toolchain.toml,victory.example.toml $root
           Copy-Item "$env:GITHUB_WORKSPACE\build-scripts\victory-build\Start-VIctory-NVIDIA.ps1" $root
           Copy-Item "$env:GITHUB_WORKSPACE\build-scripts\victory-build\README.txt" $root
+          Copy-Item "$env:GITHUB_WORKSPACE\build-scripts\victory-build\*.cmd" $root
+          Copy-Item "$env:GITHUB_WORKSPACE\build-scripts\victory-build\fullscreen.patch" $root
           @{
             source='https://github.com/Belobug/VIctory-Belobug-AMD'
             commit='cd8dfc06ace7ccb91a19431e74bc2d0de2a10145'
             cpuTarget=$env:VICTORY_CPU_TARGET
-            gpuTarget='NVIDIA GeForce RTX 5070 Ti; local GPU verification pending'
+            gpuTarget='NVIDIA GeForce RTX 5070 Ti; runtime rendering performance unverified'
+            packageRevision='fullscreen-pipeline-warmup-v2'
+            buildScriptsCommit=$env:GITHUB_SHA
             rust=(rustc --version)
             gameFilesIncluded=$false
             sha256=(Get-FileHash "$root\target\diag\victory.exe").Hash

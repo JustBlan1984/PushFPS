@@ -1,0 +1,172 @@
+--- a/crates/victory-gpu/Cargo.toml
++++ b/crates/victory-gpu/Cargo.toml
+@@ -43,4 +43,5 @@
+     "Win32_System_LibraryLoader",
+     "Win32_System_Threading",
+     "Win32_UI_WindowsAndMessaging",
++    "Win32_UI_HiDpi",
+ ] }
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -17,6 +17,8 @@
+ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+ use windows::Win32::UI::WindowsAndMessaging::*;
+ use windows::core::{Interface, PCWSTR, w};
++
++mod fullscreen;
+ 
+ /// Resource states without the console's own bits (compression hints from
+ /// bit 25 up), which the host rejects.
+@@ -9928,9 +9930,13 @@
+         height: u32,
+         format: DXGI_FORMAT,
+     ) -> windows::core::Result<Presenter> {
+-        let hwnd = match title_window() {
+-            Some(hwnd) => hwnd,
+-            None => window(width, height)?,
++        let hwnd = if fullscreen::enabled() {
++            window(width, height)?
++        } else {
++            match title_window() {
++                Some(hwnd) => hwnd,
++                None => window(width, height)?,
++            }
+         };
+         self.log_video_memory("right before the swap chain is made");
+         // SAFETY: plain object creation for our window.
+@@ -10509,6 +10515,9 @@
+ }
+ 
+ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
++    if fullscreen::enabled() {
++        return fullscreen::make(width, height);
++    }
+     const CLASS: PCWSTR = w!("VIctory");
+     // SAFETY: registers our class once and creates a window of it.
+     unsafe {
+--- /dev/null
++++ b/crates/victory-gpu/src/host/fullscreen.rs
+@@ -0,0 +1,91 @@
++//! A black monitor-sized parent with an aspect-fitted presentation child.
++//! The swap chain still contains the title's original render size; no extra
++//! GPU render target or stretch of the title's camera is required.
++
++use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
++use windows::Win32::Graphics::Gdi::{
++    BLACK_BRUSH, GetMonitorInfoW, GetStockObject, HBRUSH, MONITORINFO,
++    MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint,
++};
++use windows::Win32::System::LibraryLoader::GetModuleHandleW;
++use windows::Win32::UI::HiDpi::{
++    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
++};
++use windows::Win32::UI::WindowsAndMessaging::*;
++use windows::core::w;
++
++mod geometry;
++use geometry::fit;
++
++pub(super) fn enabled() -> bool {
++    std::env::var_os("VICTORY_FULLSCREEN").is_some_and(|v| v == "1")
++}
++
++extern "system" fn procedure(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
++    // SAFETY: Windows supplies these window-procedure arguments.
++    unsafe { DefWindowProcW(hwnd, message, wp, lp) }
++}
++
++pub(super) fn make(width: u32, height: u32) -> windows::core::Result<HWND> {
++    if width == 0 || height == 0 {
++        return Err(windows::core::Error::empty());
++    }
++    // SAFETY: all handles belong to this window thread; the parent owns the
++    // child. The class's stock background brush is owned by Windows.
++    unsafe {
++        // This thread lives only for these windows. Physical monitor pixels
++        // prevent desktop scaling from clipping a 1440p client area.
++        let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
++        let instance = GetModuleHandleW(None)?;
++        let name = w!("VIctoryAspectFullscreen");
++        let class = WNDCLASSEXW {
++            cbSize: size_of::<WNDCLASSEXW>() as u32,
++            lpfnWndProc: Some(procedure),
++            hInstance: instance.into(),
++            lpszClassName: name,
++            hCursor: LoadCursorW(None, IDC_ARROW)?,
++            hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
++            ..Default::default()
++        };
++        RegisterClassExW(&class);
++        let mut cursor = POINT::default();
++        let _ = GetCursorPos(&mut cursor);
++        let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
++        let mut info = MONITORINFO {
++            cbSize: size_of::<MONITORINFO>() as u32,
++            ..Default::default()
++        };
++        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
++            return Err(windows::core::Error::from_win32());
++        }
++        let rect = info.rcMonitor;
++        let sw = (rect.right - rect.left) as u32;
++        let sh = (rect.bottom - rect.top) as u32;
++        if sw == 0 || sh == 0 {
++            return Err(windows::core::Error::empty());
++        }
++        let parent = CreateWindowExW(
++            WINDOW_EX_STYLE(0), name, w!("VIctory - fullscreen"),
++            WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN,
++            rect.left, rect.top, sw as i32, sh as i32,
++            None, None, Some(instance.into()), None,
++        )?;
++        let (x, y, w, h) = fit(width, height, sw, sh);
++        let child = CreateWindowExW(
++            WINDOW_EX_STYLE(0), name, w!("VIctory"), WS_CHILD | WS_VISIBLE,
++            x, y, w, h, Some(parent), None, Some(instance.into()), None,
++        );
++        let child = match child {
++            Ok(child) => child,
++            Err(error) => {
++                let _ = DestroyWindow(parent);
++                return Err(error);
++            }
++        };
++        let _ = SetForegroundWindow(parent);
++        tracing::info!(width, height, screen_width=sw, screen_height=sh, x, y,
++            viewport_width=w, viewport_height=h, "aspect-preserving borderless fullscreen");
++        Ok(child)
++    }
++}
++
+--- /dev/null
++++ b/crates/victory-gpu/src/host/fullscreen/geometry.rs
+@@ -0,0 +1,29 @@
++/// Center a nonzero render size inside a nonzero monitor size.
++pub fn fit(width: u32, height: u32, screen_w: u32, screen_h: u32) -> (i32, i32, i32, i32) {
++    let (w, h) = if u64::from(screen_w) * u64::from(height)
++        > u64::from(screen_h) * u64::from(width)
++    {
++        ((u64::from(screen_h) * u64::from(width) / u64::from(height)) as u32, screen_h)
++    } else {
++        (screen_w, (u64::from(screen_w) * u64::from(height) / u64::from(width)) as u32)
++    };
++    (((screen_w - w) / 2) as i32, ((screen_h - h) / 2) as i32, w as i32, h as i32)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::fit;
++
++    #[test]
++    fn ultrawide_monitor_has_equal_side_bars() {
++        assert_eq!(fit(2560, 1440, 3440, 1440), (440, 0, 2560, 1440));
++        assert_eq!(fit(1920, 1080, 3440, 1440), (440, 0, 2560, 1440));
++    }
++
++    #[test]
++    fn other_aspects_fit_without_cropping() {
++        assert_eq!(fit(2560, 1440, 2560, 1440), (0, 0, 2560, 1440));
++        assert_eq!(fit(1920, 1080, 1920, 1200), (0, 60, 1920, 1080));
++        assert_eq!(fit(1920, 1080, 1080, 1920), (0, 656, 1080, 607));
++    }
++}
