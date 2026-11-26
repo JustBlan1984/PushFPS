@@ -28,4 +28,18 @@ inline bool dlssgLiteRuntimePresent(const std::filesystem::path& runtimeDirector
     return std::filesystem::is_regular_file(dlssgLiteDirectory(runtimeDirectory) / L"nvngx_dlssg.dll", ec);
 }
 
+// A complete, separately installed official SDK takes precedence only on native
+// NVIDIA paths. The version-specific RTX 30/40 compatibility providers stay in
+// the base directory. No DLL is modified and no fixed hash restricts user swaps.
+inline std::filesystem::path dlssCurrentDirectory(const std::filesystem::path& runtimeDirectory,
+                                                  bool nvidia, bool compatibilityRequired) {
+    if (!nvidia || compatibilityRequired) return {};
+    const auto directory = runtimeDirectory / L"dlss-current";
+    for (const auto* name : {L"nvngx_dlss.dll", L"nvngx_dlssd.dll", L"nvngx_dlssg.dll"}) {
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(directory / name, ec)) return {};
+    }
+    return directory;
+}
+
 } // namespace veyra::ngx

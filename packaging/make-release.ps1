@@ -97,6 +97,7 @@ if ($installer -match '@[A-Z0-9_]+@') { throw "Unfilled placeholder in installer
 # UTF-8 with BOM so Windows PowerShell 5.1 reads non-ASCII text correctly.
 [IO.File]::WriteAllText((Join-Path $stage 'Install-PushFPS.ps1'), $installer, (New-Object Text.UTF8Encoding $true))
 Copy-Item (Join-Path $PSScriptRoot 'Install-PushFPS.cmd') $stage
+Copy-Item (Join-Path $PSScriptRoot 'Update-NvidiaRuntime.ps1') $stage
 
 # Where the installer puts this build (Install-PushFPS.ps1): a release in the usual folder, a test build beside it.
 $installsTo = 'installs PushFPS to %LOCALAPPDATA%\Programs\PushFPS with Start menu and desktop shortcuts.'
@@ -135,7 +136,7 @@ License
   PushFPS is free software under the GNU GPL-3.0 and comes with ABSOLUTELY NO WARRANTY. It is a modified
   version of Veyra by Likely7 (https://github.com/Likely7/Veyra-NRVideo). The license, the modification
   notice and third-party notices are in PushFPS-files (LICENSE, NOTICE.md, THIRD_PARTY_NOTICES.md).
-  Source code of this release: https://github.com/DosukaSOL/PushFPS/tree/$sourceRef
+  Source code of this build: https://github.com/$($env:GITHUB_REPOSITORY)/tree/$sourceRef
 "@ | Set-Content -Path (Join-Path $stage 'READ ME FIRST.txt') -Encoding UTF8
 
 $zip = Join-Path $OutDir "$name.zip"

@@ -1740,8 +1740,16 @@ bool EnhanceGraph::initNgxFeatures()
     // DLSS-G performance mode: its runtime directory is searched before the
     // default one, so the NGX core (and its cache key) depends on it.
     dlssgLiteState_=0;dlssgDirectory_.clear();
+    const bool dlssCompatibility=ngx::FgCompatibilitySession::requested(context_.adapter().vendorId,context_.adapter().deviceId);
+    const auto currentDlss=ngx::dlssCurrentDirectory(desc_.runtimeAbsPath,
+        context_.adapter().vendorId==0x10de,dlssCompatibility);
+    if(!currentDlss.empty()){
+        dlssgDirectory_=std::filesystem::absolute(currentDlss).lexically_normal().wstring();
+        veyra::log::info("dlss-runtime",std::format("official SDK 310.9.16 priority directory={}",utf8Of(dlssgDirectory_)));
+    }
     if(desc_.enableFg&&desc_.frameGenerationBackend==engine::FrameGenerationBackend::Dlss&&desc_.dlssgLite){
         if(ngx::FgCompatibilitySession::requested(context_.adapter().vendorId,context_.adapter().deviceId))dlssgLiteState_=3;
+        else if(!currentDlss.empty())dlssgLiteState_=1;
         else if(!ngx::dlssgLiteRuntimePresent(desc_.runtimeAbsPath))dlssgLiteState_=2;
         else{dlssgLiteState_=1;dlssgDirectory_=std::filesystem::absolute(ngx::dlssgLiteDirectory(desc_.runtimeAbsPath)).lexically_normal().wstring();}
         veyra::log::info("dlssg-lite",std::format("requested=1 state={} ({}) directory={}",dlssgLiteState_,

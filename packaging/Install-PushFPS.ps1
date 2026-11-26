@@ -184,6 +184,11 @@ try {
     $exe = Get-ChildItem $stage -Recurse -Filter 'veyra_qml_ui.exe' | Select-Object -First 1
     if (-not $exe) { Fail 'The runtime package has an unexpected layout (veyra_qml_ui.exe not found).' }
     $runtimeRoot = $exe.DirectoryName
+    # Stage current signed NVIDIA DLLs before any installed file is touched.
+    if ($Gpu -eq 'NVIDIA') {
+        & (Join-Path $here 'Update-NvidiaRuntime.ps1') -RuntimeRoot $runtimeRoot
+        if (-not $?) { throw 'The NVIDIA runtime update failed' }
+    }
 
     # Licensing. By default PushFPS installs only what NVIDIA's licence allows to be passed on:
     #  - NVIDIA's runtime files only as NVIDIA ships them. A file that says it is from NVIDIA but is not

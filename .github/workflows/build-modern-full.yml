@@ -1,0 +1,863 @@
+# Builds PushFPS.exe on Windows and packages the PushFPS release zip.
+#
+# PushFPS ships as a small overlay on Veyra's official runtime package: the installer in the zip downloads
+# Veyra's NVIDIA or AMD package from Veyra's own GitHub release (checked against SHA-256 values pinned here),
+# then adds PushFPS on top. PushFPS never rehosts NVIDIA / AMD / Intel runtime files. To run inside that
+# package, PushFPS.exe is built against exactly the same Qt (6.8.3) and FFmpeg (9.0.1) ABI as Veyra.
+#
+# Every dependency below is fetched from its official public source at a pinned version; none needs a login.
+# The NVIDIA Optical Flow SDK does (developer login). When the repository secret NVOF_SDK_HEADERS holds the
+# SDK's two interface headers (base64 of a zip, from the owner's own SDK download, never committed or uploaded),
+# the build compiles NVIDIA optical flow in as Veyra does; without it, NVIDIA optical flow reports unavailable
+# and AMD FidelityFX optical flow is used (src/ngx/NvOfSessionUnavailable.cpp).
+name: PushFPS Full 4.5.4 NVIDIA update
+
+on:
+  push:
+    branches: ['modernize/full-454-dlss']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One build at a time per branch and trigger: a second push waits and then reuses the FFmpeg cache.
+# Release dispatches get their own group, so a release never cancels (or is cancelled by) the push
+# build of the same commit; GitHub cancels an older *pending* run when a newer one queues in the same
+# group, and a cancelled push run makes the README build badge read "failing".
+concurrency:
+  group: build-windows-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: Likely7/Veyra-NRVideo
+  # The runtime package (Qt, FFmpeg, the vendors' runtimes) the installer downloads. 2.2.1's has the same
+  # vendor runtimes as 2.1.9's (upstream-inspect, 24 November 2026: every file under runtime\ has the same
+  # name and size) and FFmpeg 9.0.1 rebuilt with FFmpeg's fix for the d3d12va reference-only surface pool
+  # (bcd2c69e087a: PS5 hardware decoding stopped after about 71 frames on cards such as the RX 9070 XT).
+  # Its program sits under versions\2.2.1\; the installer finds the runtime by the program's folder.
+  UPSTREAM_TAG: v2.2.1
+  VCPKG_COMMIT: 30ef65cad98f08e7197c9a1656fbd871bcb72f2d   # builtin-baseline in vcpkg.json: FFmpeg 9.0.1
+  DLSS_TAG: v310.9.16
+  NVCODEC_TAG: n13.0.19.0
+  CUDART_ZIP: https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.9.79-archive.zip
+  XESS_TAG: v3.0.2
+  FFX1_TAG: v1.1.4
+  FFX2_TAG: v2.3.0
+  AMF_COMMIT: 57ee0cfb0e1a08d9041f77435653794c1b012be0   # AMD AMF SDK v1.5.3 (MIT headers only; runtime = AMD driver)
+  # Streaming sources (PS5 Remote Play, Moonlight, Xbox), as Veyra builds them: pinned sources,
+  # verified by scripts/remoteplay/verify-chiaki-stage.py and scripts/moonlight/verify-moonlight-stage.py.
+  CHIAKI_COMMIT: 0e16950165f06e5c3291537c2eeba6e852be7120
+  MOONLIGHT_COMMIT: f900dd4767759c7b9d0e93bcea666b55c69ea62f
+
+jobs:
+
+  runtime-validation:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: CPU runtime-selection regression
+        timeout-minutes: 5
+        run: |
+          New-Item -ItemType Directory -Force D:\modern-tests | Out-Null
+          cl /nologo /std:c++20 /EHsc /W4 /I include tests/unit/DlssRuntimeSelectionTests.cpp /Fe:D:\modern-tests\policy.exe /Fo:D:\modern-tests\policy.obj
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & D:\modern-tests\policy.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Windows PowerShell 5.1 runtime staging and compatibility preservation
+        timeout-minutes: 5
+        run: |
+          $root = 'D:\modern-runtime-check'
+          $legacy = Join-Path $root 'runtime\experimental'
+          New-Item -ItemType Directory -Force $legacy | Out-Null
+          foreach ($name in 'nvngx_dlss.dll', 'nvngx_dlssg.dll') {
+            Set-Content (Join-Path $legacy $name) 'original compatibility fixture'
+          }
+          $before = (Get-FileHash "$legacy\nvngx_dlss*.dll").Hash -join ','
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging/Update-NvidiaRuntime.ps1 -RuntimeRoot $root
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (((Get-FileHash "$legacy\nvngx_dlss*.dll").Hash -join ',') -ne $before) { throw 'Original DLLs were changed' }
+          $manifest = Get-Content "$root\pushfps-nvidia-runtime.json" -Raw | ConvertFrom-Json
+          if ($manifest.sdk -ne '310.9.16' -or $manifest.files.Count -ne 3) { throw 'Incomplete SDK manifest' }
+          foreach ($file in $manifest.files) {
+            $installed = Join-Path $root $file.path
+            if ((Get-FileHash -LiteralPath $installed).Hash -ne $file.sha256) { throw 'Installed hash differs from manifest' }
+          }
+          # Second run must succeed from the verified cache, preserving the same compatibility files.
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging/Update-NvidiaRuntime.ps1 -RuntimeRoot $root
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (((Get-FileHash "$legacy\nvngx_dlss*.dll").Hash -join ',') -ne $before) { throw 'Reinstall changed original DLLs' }
+          Write-Host 'Official DLL version/hash/signature verification, staging, cached reinstall and compatibility preservation: PASS'
+
+  build:
+    needs: runtime-validation
+    runs-on: windows-2022
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DEPS: D:\deps
+      BUILD: D:\b
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # A release tag (v2.1.5) builds exactly that version; every other build is 2.1.5-pushfps.<run>.
+      - name: Version
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          if ($tag -and $tag -notmatch '^v\d+\.\d+\.\d+$') { throw "release_tag must look like v2.1.5" }
+          if ($tag) { $v = $tag.TrimStart('v') }
+          elseif ($env:GITHUB_REF -like 'refs/tags/v*') { $v = $env:GITHUB_REF_NAME.TrimStart('v') }
+          else { $v = "4.5.4-modern.$env:GITHUB_RUN_NUMBER" }
+          "PUSHFPS_VERSION=$v" | Out-File -Append $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force $env:DEPS | Out-Null
+          Write-Host "PushFPS $v"
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Qt 6.8.3 (MSVC 2022 x64)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          dir: D:\
+          cache: true
+
+      - name: NVIDIA DLSS SDK ${{ env.DLSS_TAG }} (headers + static NGX library)
+        working-directory: D:\deps
+        shell: bash
+        run: |
+          GIT_LFS_SKIP_SMUDGE=1 git clone -q --depth 1 --branch "$DLSS_TAG" --filter=blob:none --sparse https://github.com/NVIDIA/DLSS.git dlss
+          git -C dlss sparse-checkout set include lib/Windows_x86_64/x64
+          test "$(git -C dlss rev-parse HEAD)" = "9981c6350dc58c0ce21f024fd65e31e851c31689"
+          test -f dlss/include/nvsdk_ngx.h && test -f dlss/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib
+
+      - name: NVENC headers, CUDA driver header, XeSS, FidelityFX
+        working-directory: D:\deps
+        shell: bash
+        run: |
+          set -e
+          git clone -q --depth 1 --branch "$NVCODEC_TAG" https://github.com/FFmpeg/nv-codec-headers.git nv-codec-headers
+          curl -sSfL "$CUDART_ZIP" -o cudart.zip && unzip -q cudart.zip -d cudart && mv cudart/*/ cudart-root
+          test -f cudart-root/include/cuda.h
+          gh release download "$XESS_TAG" -R intel/xess -p '*.zip' -O xess.zip && unzip -q xess.zip -d xess
+          find xess -name xefg_swapchain_d3d12.h | head -1
+          GIT_LFS_SKIP_SMUDGE=1 git clone -q --depth 1 --branch "$FFX2_TAG" --filter=blob:none --sparse https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git ffx2
+          git -C ffx2 sparse-checkout set Kits/FidelityFX/api/include Kits/FidelityFX/framegeneration/include Kits/FidelityFX/upscalers/include
+          gh release download "$FFX1_TAG" -R GPUOpen-LibrariesAndSDKs/FidelityFX-SDK -p '*.zip' -O ffx1.zip && unzip -q ffx1.zip -d ffx1
+          # AMD AMF SDK public headers (MIT), for AMD FRC frame generation (Veyra 2.1.9). Only the headers:
+          # the AMF runtime (amfrt64.dll) comes with the user's AMD driver and is never shipped.
+          git init -q amf && git -C amf remote add origin https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git
+          git -C amf fetch -q --depth 1 --filter=blob:none origin "$AMF_COMMIT"
+          git -C amf sparse-checkout set amf/public/include && git -C amf checkout -q FETCH_HEAD
+          test -f amf/amf/public/include/components/FRC.h
+
+      # FidelityFX 1.1.4 ships source only. Build the optical flow + DX12 backend static libraries with the
+      # static C runtime (/MT), as PushFPS links it; they land in sdk/bin/ffx_sdk where CMakeLists.txt looks.
+      - name: Build FidelityFX 1.1.4 optical flow (static)
+        working-directory: D:\deps\ffx1\sdk
+        run: |
+          cmake -S . -B build -A x64 -DFFX_API_BACKEND=DX12_X64 -DFFX_ALL=OFF -DFFX_OF=ON -DFFX_AUTO_COMPILE_SHADERS=1 `
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --config Release --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem bin\ffx_sdk -Filter *.lib | Format-Table Name, Length
+
+      - name: Locate SDK roots
+        shell: bash
+        run: |
+          xess=$(dirname "$(dirname "$(dirname "$(find /d/deps/xess -name xefg_swapchain_d3d12.h | head -1)")")")
+          ffx1lib=$(find /d/deps/ffx1/sdk/bin -iname 'ffx_opticalflow_x64.lib' | head -1)
+          ffx1=""; [ -n "$ffx1lib" ] && ffx1=$(dirname "$(dirname "$(dirname "$ffx1lib")")")
+          {
+            echo "XESS_ROOT=$(cygpath -m "$xess")"
+            echo "FFX1_ROOT=$( [ -n "$ffx1" ] && cygpath -m "$ffx1" )"
+          } >> "$GITHUB_ENV"
+          echo "XeSS root: $xess"; echo "FidelityFX 1.x root: ${ffx1:-not found}"
+          if [ -z "$ffx1" ]; then echo "::error::FidelityFX 1.1.4 optical flow libraries not found; PushFPS needs them for optical flow"; exit 1; fi
+
+      # Restore and save are separate steps: actions/cache only saves when the whole job succeeds,
+      # and FFmpeg takes ~25 minutes to build, so it is saved as soon as it is built. vcpkg reuses a
+      # cached package only when its ABI hash (compiler included) matches, so every run saves its
+      # binary cache under a new key and restores the newest one.
+      - name: Restore vcpkg binaries
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: D:\deps\vcpkg-binary
+          key: vcpkg-bin-${{ env.VCPKG_COMMIT }}-v2-${{ github.run_id }}
+          restore-keys: vcpkg-bin-${{ env.VCPKG_COMMIT }}-v2-
+
+      - name: FFmpeg 9.0.1 (vcpkg at the pinned baseline)
+        working-directory: D:\deps
+        run: |
+          git init -q vcpkg; git -C vcpkg remote add origin https://github.com/microsoft/vcpkg.git
+          git -C vcpkg fetch -q --depth 1 origin $env:VCPKG_COMMIT; git -C vcpkg checkout -q FETCH_HEAD
+          & vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          New-Item -ItemType Directory -Force vcpkg-binary | Out-Null
+          $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:DEPS\vcpkg-binary"
+          & vcpkg\vcpkg.exe install "ffmpeg[core,avcodec,avformat,avfilter,swresample,swscale]:x64-windows" --clean-after-build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem vcpkg\installed\x64-windows\bin\av*.dll, vcpkg\installed\x64-windows\bin\sw*.dll | Format-Table Name, Length
+
+      - name: Streaming dependencies (static, for PS5 Remote Play, Moonlight and Xbox)
+        working-directory: D:\deps
+        run: |
+          $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:DEPS\vcpkg-binary"
+          # The same static tree Veyra uses (scripts/xbox/dependency-lock.json): one OpenSSL for Chiaki,
+          # Moonlight and libdatachannel; libjuice with Veyra's reviewed overlay.
+          & vcpkg\vcpkg.exe install --classic --triplet x64-windows-static "--x-install-root=$env:DEPS\stream-installed" `
+            "--overlay-ports=$env:GITHUB_WORKSPACE\scripts\xbox\vcpkg-overlay" `
+            openssl opus json-c libevent miniupnpc protobuf "sdl3" "libdatachannel[srtp,ws]" nlohmann-json pkgconf zlib --clean-after-build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem "$env:DEPS\stream-installed\x64-windows-static\lib" -Filter *.lib | Format-Table Name, Length
+
+      - name: Save vcpkg binaries
+        if: always() && steps.vcpkg-cache.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: D:\deps\vcpkg-binary
+          key: vcpkg-bin-${{ env.VCPKG_COMMIT }}-v2-${{ github.run_id }}
+
+      - name: Streaming sources (Chiaki-ng with Veyra's patches, moonlight-common-c)
+        working-directory: D:\deps
+        run: |
+          git config --global core.autocrlf false
+          git config --global advice.detachedHead false
+          # Chiaki-ng: a clean pinned checkout, and a worktree with the reviewed patches (0003: four of
+          # chiaki-ng's own later commits for buttons that stayed pressed, checked to be exactly those).
+          git clone -q https://github.com/streetpea/chiaki-ng.git chiaki-clean
+          git -C chiaki-clean checkout -q $env:CHIAKI_COMMIT
+          git -C chiaki-clean submodule update -q --init --recursive
+          git -C chiaki-clean worktree add -q --detach "$env:DEPS\chiaki-stage" $env:CHIAKI_COMMIT
+          git -C chiaki-stage submodule update -q --init --recursive
+          foreach ($p in '0001-chiaki-msvc-vla-compat.patch', '0002-chiaki-video-metadata.patch', '0003-chiaki-feedback-history.patch', '0004-chiaki-pad-proc-no.patch', '0005-chiaki-socket-receive-buffer.patch') {
+            git -C chiaki-stage apply "$env:GITHUB_WORKSPACE\scripts\remoteplay\patches\$p"
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error::$p does not apply"; exit 1 }
+          }
+          python "$env:GITHUB_WORKSPACE\scripts\remoteplay\verify-chiaki-stage.py" --stage "$env:DEPS\chiaki-stage" --clean "$env:DEPS\chiaki-clean"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # moonlight-common-c with its pinned ENet and nanors.
+          git clone -q https://github.com/moonlight-stream/moonlight-common-c.git moonlight-common-c
+          git -C moonlight-common-c checkout -q $env:MOONLIGHT_COMMIT
+          git -C moonlight-common-c submodule update -q --init --recursive
+          python "$env:GITHUB_WORKSPACE\scripts\moonlight\verify-moonlight-stage.py" --source "$env:DEPS\moonlight-common-c" --lock "$env:GITHUB_WORKSPACE\scripts\moonlight\dependency-lock.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Chiaki's protocol buffers are generated by nanopb's Python generator, which also runs protoc
+          # (from the static tree) to build its own descriptor module.
+          python -m pip install -q protobuf
+          "$env:DEPS\stream-installed\x64-windows-static\tools\protobuf" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      # Optional: NVIDIA Optical Flow SDK 5.0.7 interface headers (nvOpticalFlowCommon.h, nvOpticalFlowD3D12.h)
+      # from the secret NVOF_SDK_HEADERS. They stay on the runner; nothing here uploads or packages them.
+      - name: NVIDIA Optical Flow headers (optional)
+        env:
+          NVOF_SDK_HEADERS: ${{ secrets.NVOF_SDK_HEADERS }}
+        run: |
+          if (-not $env:NVOF_SDK_HEADERS) {
+            Write-Host "No NVOF_SDK_HEADERS secret: NVIDIA optical flow stays unavailable, AMD FidelityFX optical flow is used"
+            exit 0
+          }
+          $root = "$env:RUNNER_TEMP\nvof-sdk"
+          $dir = "$root\NvOFInterface"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $zip = "$env:RUNNER_TEMP\nvof-headers.zip"
+          [IO.File]::WriteAllBytes($zip, [Convert]::FromBase64String(($env:NVOF_SDK_HEADERS -replace '\s', '')))
+          Expand-Archive $zip -DestinationPath $dir -Force
+          Remove-Item $zip
+          # Accept the headers at the zip's top level or inside one folder.
+          foreach ($h in 'nvOpticalFlowCommon.h', 'nvOpticalFlowD3D12.h') {
+            if (-not (Test-Path "$dir\$h")) {
+              $found = Get-ChildItem $dir -Recurse -Filter $h | Select-Object -First 1
+              if (-not $found) { Write-Host "::error::NVOF_SDK_HEADERS has no $h"; exit 1 }
+              Copy-Item $found.FullName "$dir\$h"
+            }
+          }
+          Write-Host "NVIDIA Optical Flow headers present: NVIDIA optical flow is built in"
+          "NVOF_SDK_ROOT=$root" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      # PushFlow (PushFPS's own frame generation): ONNX Runtime (DirectML build) and DirectML from nuget.org,
+      # RIFE models from vs-mlrt (MIT weights), checked on the CPU and converted to half precision. They are
+      # packaged into runtime\experimental\pushflow; nothing here is committed.
+      # Its own Python in its own virtual environment: onnxconverter-common pins an old protobuf, and the
+      # streaming build's nanopb needs the runner's own Python and protobuf untouched.
+      - uses: actions/setup-python@v5
+        id: pushflow-python
+        with:
+          python-version: '3.12'
+          update-environment: false
+      - name: PushFlow runtime (ONNX Runtime + DirectML, RIFE models)
+        env:
+          PUSHFLOW_PYTHON: ${{ steps.pushflow-python.outputs.python-path }}
+        run: |
+          $venv = Join-Path $env:RUNNER_TEMP 'pushflow-venv'
+          & $env:PUSHFLOW_PYTHON -m venv $venv
+          $py = Join-Path $venv 'Scripts\python.exe'
+          & $py -m pip install --disable-pip-version-check -q onnx==1.17.0 onnxconverter-common==1.14.0 onnxruntime==1.20.1 numpy==1.26.4
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $py -I scripts/pushflow/prepare_runtime.py --out "$env:DEPS\pushflow"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Dolby Vision metadata parsing (quietvoid/dovi_tool, MIT), built here from the pinned source: nothing of it is
+      # in the repository. When this step fails the program is built without it (Dolby Vision files then play through
+      # FFmpeg's own parsing, without the enhancement-layer cases) and the Configure step says so.
+      - name: Dolby Vision parsing library (libdovi 3.4.0, built from pinned source)
+        continue-on-error: true
+        timeout-minutes: 25
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = "$env:DEPS\dovi_tool"; $out = "$env:DEPS\libdovi"
+          git clone -q https://github.com/quietvoid/dovi_tool $src
+          git -C $src checkout -q d1abe0e27ff2c7ab3339614d06db9f8a058af6b2
+          Push-Location "$src\dolby_vision"
+          cargo rustc --release --features capi --crate-type cdylib
+          if ($LASTEXITCODE -ne 0) { throw 'libdovi did not build' }
+          cargo install cbindgen --version 0.29.4 --locked
+          if ($LASTEXITCODE -ne 0) { throw 'cbindgen did not install' }
+          New-Item -ItemType Directory -Force "$out\include\libdovi", "$out\lib", "$out\bin" | Out-Null
+          cbindgen --config cbindgen.toml --crate dolby_vision --output "$out\include\libdovi\rpu_parser.h"
+          if ($LASTEXITCODE -ne 0) { throw 'the libdovi header was not generated' }
+          Pop-Location
+          $dll = Get-ChildItem $src -Recurse -File -Filter dolby_vision.dll | Where-Object FullName -match '\\release\\' | Select-Object -First 1
+          $lib = Get-ChildItem $src -Recurse -File -Filter dolby_vision.dll.lib | Where-Object FullName -match '\\release\\' | Select-Object -First 1
+          if (-not $dll -or -not $lib) { throw 'libdovi: the built library was not found' }
+          Copy-Item $dll.FullName "$out\bin"; Copy-Item $lib.FullName "$out\lib"
+          Copy-Item (Get-ChildItem $src -File -Filter 'LICENSE*' | Select-Object -First 1).FullName "$out\LICENSE"
+          Get-ChildItem $out -Recurse -File | Format-Table FullName, Length
+          Select-String -Path "$out\include\libdovi\rpu_parser.h" -Pattern 'dovi_parse|dovi_rpu' | Select-Object -First 5
+          "LIBDOVI_ROOT=$out" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Configure
+        run: |
+          $ffmpeg = "$env:DEPS\vcpkg\installed\x64-windows"
+          $stream = "$env:DEPS\stream-installed\x64-windows-static"
+          $env:PKG_CONFIG_PATH = "$stream\lib\pkgconfig"
+          $dovi = @('-DVEYRA_ENABLE_LIBDOVI=OFF')
+          if ($env:LIBDOVI_ROOT -and (Test-Path "$env:LIBDOVI_ROOT\bin\dolby_vision.dll") -and (Test-Path "$env:LIBDOVI_ROOT\include\libdovi\rpu_parser.h")) {
+            $dovi = @('-DVEYRA_ENABLE_LIBDOVI=ON', "-DVEYRA_LIBDOVI_ROOT=$env:LIBDOVI_ROOT")
+          } else { Write-Host '::warning::libdovi was not built: this build has no Dolby Vision enhancement-layer parsing' }
+          cmake -S . -B $env:BUILD -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR;$ffmpeg;$stream" `
+            -DVEYRA_BUILD_QML_UI=ON -DVEYRA_ENABLE_EXPERIMENTAL_DLSSNR=ON -DVEYRA_ENABLE_D3D12_DEBUG=OFF `
+            -DVEYRA_ENABLE_REMOTEPLAY=ON -DVEYRA_ENABLE_MOONLIGHT=ON -DVEYRA_ENABLE_XBOX=ON `
+            "-DVEYRA_RP_CHIAKI_SOURCE_DIR=$env:DEPS\chiaki-stage" "-DVEYRA_RP_CHIAKI_VERIFY_DIR=$env:DEPS\chiaki-clean" `
+            "-DVEYRA_MOONLIGHT_SOURCE_DIR=$env:DEPS\moonlight-common-c" `
+            "-DPROTOC=$stream\tools\protobuf\protoc.exe" "-DPKG_CONFIG_EXECUTABLE=$stream\tools\pkgconf\pkgconf.exe" `
+            -DOPENSSL_USE_STATIC_LIBS=ON -DOPENSSL_MSVC_STATIC_RT=ON `
+            "-DVEYRA_DISPLAY_VERSION=$env:PUSHFPS_VERSION" `
+            "-DVEYRA_FFMPEG_ROOT=$ffmpeg" `
+            "-DVEYRA_DLSS_SDK_ROOT=$env:DEPS\dlss" `
+            "-DVEYRA_NVENC_HEADERS_ROOT=$env:DEPS\nv-codec-headers" `
+            "-DVEYRA_CUDA_DRIVER_INCLUDE_DIR=$env:DEPS\cudart-root\include" `
+            "-DVEYRA_XESS_ROOT=$env:XESS_ROOT" `
+            "-DVEYRA_FIDELITYFX_ROOT=$env:FFX1_ROOT" `
+            "-DVEYRA_FIDELITYFX2_ROOT=$env:DEPS\ffx2\Kits\FidelityFX" `
+            "-DVEYRA_AMF_SDK_ROOT=$env:DEPS\amf\amf\public" `
+            "-DVEYRA_NVOF_SDK_ROOT=$env:NVOF_SDK_ROOT" `
+            "-DVEYRA_ONNXRUNTIME_ROOT=$env:DEPS\pushflow\ort" "-DVEYRA_DIRECTML_ROOT=$env:DEPS\pushflow\dml" @dovi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build PushFPS.exe
+        id: buildexe
+        timeout-minutes: 15
+        run: |
+          # -k 0: every compile error of a run in one log, not the first one only.
+          cmake --build $env:BUILD --target veyra_qml_ui --parallel 2 -- -k 0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Item "$env:BUILD\PushFPS.exe" | Format-List Name, Length, VersionInfo
+
+      # Every check from here to the install test runs whenever the program was built, also after an earlier one
+      # failed: one run then shows everything that is wrong, instead of one fault an hour. The job still fails,
+      # and nothing is published from a failed job (the release steps keep their default condition).
+      - name: Unit tests that need no GPU
+        if: ${{ !cancelled() && steps.buildexe.outcome == 'success' }}
+        run: |
+          cmake --build $env:BUILD --target veyra_update_checker_tests veyra_update_verify_tests veyra_ui_i18n_tests --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:PATH = "$env:QT_ROOT_DIR\bin;$env:PATH"
+          $failed = 0
+          foreach ($t in 'veyra_update_checker_tests', 'veyra_update_verify_tests', 'veyra_ui_i18n_tests') {
+            $exe = Get-ChildItem $env:BUILD -Recurse -Filter "$t.exe" | Select-Object -First 1
+            if (-not $exe) { Write-Host "::error::$t.exe not built"; $failed++; continue }
+            & $exe.FullName -o "$t.txt,txt" 2>&1 | Out-Host
+            $code = $LASTEXITCODE
+            if (Test-Path "$t.txt") { Get-Content "$t.txt" | Out-Host }
+            Write-Host "$t exit $code"
+            if ($code -ne 0) { $failed++ }
+          }
+          foreach ($t in 'veyra_dlss_runtime_selection_tests', 'veyra_sound_profile_tests', 'veyra_push_audio_mix_tests', 'veyra_push_studio_sources_tests', 'veyra_push_benchmark_tests', 'veyra_push_hud_tests', 'veyra_push_adaptive_fg_tests', 'veyra_push_pacing_repair_tests', 'veyra_push_archive_paths_tests', 'veyra_push_crash_note_tests', 'veyra_push_compare_plan_tests', 'veyra_push_fg_health_tests', 'veyra_push_half_rate_tests', 'veyra_push_record_parts_tests', 'veyra_push_capture_audio_suggest_tests', 'veyra_push_record_quality_tests', 'veyra_push_compare_name_tests', 'veyra_push_caption_hold_tests', 'veyra_push_display_cap_tests', 'veyra_push_remote_sync_tests', 'veyra_push_pairing_input_tests', 'veyra_push_psn_sign_in_tests', 'veyra_push_retry_wait_tests', 'veyra_push_stream_size_tests', 'veyra_push_packet_stamps_tests', 'veyra_push_free_sync_tests', 'veyra_push_log_limiter_tests', 'veyra_push_boost_limiter_tests', 'veyra_push_pair_phase_tests', 'veyra_push_capture_device_pick_tests', 'veyra_push_capture_sharper_tests', 'veyra_push_timed_probe_tests', 'veyra_push_gpu_load_tests', 'veyra_push_ocr_tests', 'veyra_push_ocr_windows_tests', 'veyra_push_control_tests', 'veyra_push_clip_markers_tests', 'veyra_push_present_scaling_tests', 'veyra_push_hud_still_tests', 'veyra_push_overlay_tests', 'veyra_push_audio_trim_tests', 'veyra_push_compare_line_tests', 'veyra_push_display_peak_tests', 'veyra_push_dolby_vision_tests', 'veyra_remoteplay_core_tests', 'veyra_push_perf_report_tests', 'veyra_push_half_approval_tests', 'veyra_push_view_crop_tests', 'veyra_push_flow_motion_tests', 'veyra_push_flow2_tests', 'veyra_push_flow_guard_tests', 'veyra_push_flow_predict_tests', 'veyra_push_response_tests', 'veyra_remoteplay_feedback_wire_tests', 'veyra_frame_input_tests', 'veyra_push_quality_tests', 'veyra_push_input_latency_tests', 'veyra_vrr_profile_tests') {
+            cmake --build $env:BUILD --target $t --parallel 2
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error::$t did not build"; $failed++; continue }
+            $exe = Get-ChildItem $env:BUILD -Recurse -Filter "$t.exe" | Select-Object -First 1
+            & $exe.FullName 2>&1 | Out-Host
+            Write-Host "$t exit $LASTEXITCODE"
+            if ($LASTEXITCODE -ne 0) { $failed++ }
+          }
+          if ($failed) { exit 1 }
+
+      - name: NVIDIA Image Scaling on D3D12 (WARP when there is no GPU)
+        if: ${{ !cancelled() && steps.buildexe.outcome == 'success' }}
+        run: |
+          cmake --build $env:BUILD --target veyra_nis_gpu_tests --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Get-ChildItem $env:BUILD -Recurse -Filter 'veyra_nis_gpu_tests.exe' | Select-Object -First 1
+          if (-not $exe) { Write-Host "::error::veyra_nis_gpu_tests.exe not built"; exit 1 }
+          $stage = Join-Path $env:RUNNER_TEMP 'nis-gpu'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item $exe.FullName $stage
+          Copy-Item -Recurse -Force "$env:BUILD\shaders" (Join-Path $stage 'shaders')
+          Get-ChildItem (Join-Path $stage 'shaders') -Filter 'Nis*.dxil' | Format-Table Name, Length
+          $env:PATH = "$env:DEPS\vcpkg\installed\x64-windows\bin;$env:QT_ROOT_DIR\bin;$env:PATH"
+          $env:VEYRA_NIS_GPU_DEBUG = '1'
+          & (Join-Path $stage 'veyra_nis_gpu_tests.exe') 2>&1 | Out-Host
+          $code = $LASTEXITCODE
+          Write-Host "veyra_nis_gpu_tests exit $code"
+          if ($code -ne 0) { exit 1 }
+
+      - name: PushFPS comparison clips and HUD sampling on D3D12 (WARP when there is no GPU)
+        if: ${{ !cancelled() && steps.buildexe.outcome == 'success' }}
+        run: |
+          cmake --build $env:BUILD --target veyra_push_gpu_tests --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Get-ChildItem $env:BUILD -Recurse -Filter 'veyra_push_gpu_tests.exe' | Select-Object -First 1
+          if (-not $exe) { Write-Host "::error::veyra_push_gpu_tests.exe not built"; exit 1 }
+          $env:PATH = "$env:DEPS\vcpkg\installed\x64-windows\bin;$env:QT_ROOT_DIR\bin;$env:PATH"
+          $env:VEYRA_PUSH_GPU_DEBUG = '1'
+          # PushFlow runs on the release's own runtime (RIFE through DirectML, on WARP here).
+          $env:VEYRA_PUSHFLOW_TEST_RUNTIME = "$env:DEPS\pushflow\runtime"
+          & $exe.FullName 2>&1 | Out-Host
+          $code = $LASTEXITCODE
+          Write-Host "veyra_push_gpu_tests exit $code"
+          if ($code -ne 0) { exit 1 }
+          # PushFlowBench (shipped next to PushFPS.exe): a short smoke run on WARP; the JSON goes in the log.
+          # (--compare-shapes and --compare-sync add the dynamic-shape and waiting variants: run 44202258035,
+          # 2026-11-18, has them; they triple this step's time, so they are not run on every build.)
+          cmake --build $env:BUILD --target veyra_pushflow_bench --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:BUILD\PushFlowBench.exe" --warp --sizes 640x360 --pairs 2 --runtime "$env:DEPS\pushflow\runtime" --out "$env:RUNNER_TEMP\pushflow-bench.json" 2>&1 | Out-Host
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::PushFlowBench failed"; exit 1 }
+          # Does memory grow when queued inference never does a full wait? (decides PushFlowBackend's kSyncEvery)
+          & "$env:BUILD\PushFlowBench.exe" --warp --sizes 256x160 --tiers 0 --leak-check 160 --runtime "$env:DEPS\pushflow\runtime" --out "$env:RUNNER_TEMP\pushflow-leak.json" 2>&1 | Out-Host
+          Write-Host "leak check exit $LASTEXITCODE"
+          # PushFlow started and shut down at once with its work still queued (a settings rebuild, an optimiser
+          # step, a stream that changes size right after connecting; field dump of 2026-11-17). Guarded: no
+          # ONNX Runtime fault and every session's buffer pool held until the session is gone. The guard
+          # relies on the pinned ONNX Runtime, so a new pin that changes it fails here.
+          & "$env:BUILD\PushFlowBench.exe" --warp --teardown-check 6 --runtime "$env:DEPS\pushflow\runtime" --out "$env:RUNNER_TEMP\pushflow-teardown.json" 2>&1 | Out-Host
+          if (-not (Test-Path "$env:RUNNER_TEMP\pushflow-teardown.json")) { Write-Host "::error::PushFlow teardown check wrote no result"; exit 1 }
+          Get-Content "$env:RUNNER_TEMP\pushflow-teardown.json" | Out-Host
+          $td = Get-Content "$env:RUNNER_TEMP\pushflow-teardown.json" -Raw | ConvertFrom-Json
+          if ($td.faults -ne 0 -or -not $td.poolHeld -or $td.started -lt 20 -or $td.runFailures -ne 0 -or $td.deviceState -ne 0) {
+            Write-Host "::error::PushFlow teardown check failed (faults=$($td.faults) started=$($td.started) poolHeld=$($td.poolHeld))"; exit 1
+          }
+          # The same without the guard (session teardown as in 3.2.0), for the log only.
+          $env:VEYRA_PUSHFLOW_TEST_UNGUARDED = "1"
+          & "$env:BUILD\PushFlowBench.exe" --warp --teardown-check 6 --runtime "$env:DEPS\pushflow\runtime" --out "$env:RUNNER_TEMP\pushflow-teardown-unguarded.json" 2>&1 | Out-Host
+          Write-Host "unguarded teardown check exit $LASTEXITCODE"
+          if (Test-Path "$env:RUNNER_TEMP\pushflow-teardown-unguarded.json") { Get-Content "$env:RUNNER_TEMP\pushflow-teardown-unguarded.json" | Out-Host }
+          Remove-Item Env:VEYRA_PUSHFLOW_TEST_UNGUARDED
+          # The half precision probe PushFPS runs in its own process (Settings: PushFlow half precision -> Test).
+          # It must end with a result whatever fp16 does on WARP (2026-11-17: fp16 removed the WARP device).
+          & "$env:BUILD\PushFlowBench.exe" --warp --fp16-probe --sizes 320x180 --pairs 4 --runtime "$env:DEPS\pushflow\runtime" --out "$env:RUNNER_TEMP\pushflow-fp16.json" 2>&1 | Out-Host
+          Write-Host "fp16 probe exit $LASTEXITCODE"
+          if (Test-Path "$env:RUNNER_TEMP\pushflow-fp16.json") { Get-Content "$env:RUNNER_TEMP\pushflow-fp16.json" | Out-Host } else { Write-Host "::warning::fp16 probe wrote no result" }
+          Get-Content "$env:RUNNER_TEMP\pushflow-bench.json" | Out-Host
+
+      # PushFlow through the engine's own graph, the way the program runs it: every pair must be offered to
+      # PushFlow and come back with its generated frames, at 2X and 3X. (The step above drives PushFlow on its
+      # own; 3.2.0 shipped with the graph never asking it for a frame, and only a test like this one sees that.)
+      - name: PushFlow through the enhancement graph, as the program runs it
+        if: ${{ !cancelled() && steps.buildexe.outcome == 'success' }}
+        run: |
+          cmake --build $env:BUILD --target veyra_push_flow_graph_tests --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Get-ChildItem $env:BUILD -Recurse -Filter 'veyra_push_flow_graph_tests.exe' | Select-Object -First 1
+          if (-not $exe) { Write-Host "::error::veyra_push_flow_graph_tests.exe not built"; exit 1 }
+          $env:PATH = "$env:DEPS\vcpkg\installed\x64-windows\bin;$env:QT_ROOT_DIR\bin;$env:PATH"
+          & $exe.FullName "$env:RUNNER_TEMP\pushflow-graph" "$env:DEPS\pushflow\runtime" 2>&1 | Out-Host
+          $code = $LASTEXITCODE
+          Write-Host "veyra_push_flow_graph_tests exit $code"
+          if ($code -ne 0) {
+            Get-Content "$env:RUNNER_TEMP\pushflow-graph\engine.log" -Tail 60 -ErrorAction SilentlyContinue | Out-Host
+            Write-Host "::error::PushFlow did not generate frames through the enhancement graph"; exit 1
+          }
+
+      # PushFlow 2's Predict through the whole engine, with a live source (a Frame Input channel the test feeds
+      # itself): the engine's pair timing, admission and presentation order with Predict on, which the graph
+      # test cannot reach. The program finds PushFlow under <its folder>\runtime\experimental, so that folder
+      # is linked in for this step only and taken away again. Software renderer: it says the engine keeps
+      # playing and shows real frames sooner, nothing about a real graphics card.
+      - name: PushFlow 2 Predict through the engine, with a live source
+        if: ${{ !cancelled() && steps.buildexe.outcome == 'success' }}
+        run: |
+          cmake --build $env:BUILD --target veyra_push_predict_engine_tests --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Get-ChildItem $env:BUILD -Recurse -Filter 'veyra_push_predict_engine_tests.exe' | Select-Object -First 1
+          if (-not $exe) { Write-Host "::error::veyra_push_predict_engine_tests.exe not built"; exit 1 }
+          $root = $exe.DirectoryName
+          $madeRuntime = -not (Test-Path "$root\runtime")
+          $madeData = -not (Test-Path "$root\runtime_local")
+          if ($madeData) { New-Item -ItemType Directory -Force -Path "$root\runtime_local" | Out-Null }
+          if ($madeRuntime) {
+            New-Item -ItemType Directory -Force -Path "$root\runtime" | Out-Null
+            New-Item -ItemType Junction -Path "$root\runtime\experimental" -Target "$env:DEPS\pushflow\runtime" | Out-Null
+          }
+          $env:PATH = "$env:DEPS\vcpkg\installed\x64-windows\bin;$env:QT_ROOT_DIR\bin;$env:PATH"
+          & $exe.FullName "$env:RUNNER_TEMP\pushflow-predict-engine" 2>&1 | Out-Host
+          $code = $LASTEXITCODE
+          Write-Host "veyra_push_predict_engine_tests exit $code"
+          # The link is taken away, not what it points to.
+          if ($madeRuntime) { (Get-Item "$root\runtime\experimental").Delete(); Remove-Item "$root\runtime" -Force }
+          if ($madeData) { Remove-Item "$root\runtime_local" -Recurse -Force -ErrorAction SilentlyContinue }
+          if ($code -ne 0) {
+            Get-Content "$env:RUNNER_TEMP\pushflow-predict-engine\engine.log" -Tail 80 -ErrorAction SilentlyContinue | Out-Host
+            Write-Host "::error::Predict did not play a live source through the engine as expected"; exit 1
+          }
+
+      # Going live: two outputs at once (RTMP + RTMPS through Schannel) to a local MediaMTX, read back,
+      # server restart, a closed port, key redaction. Proves the FFmpeg build has rtmp/rtmps.
+      - name: Going-live tests (local RTMP/RTMPS server)
+        if: ${{ !cancelled() && steps.buildexe.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -e
+          build=$(cygpath -u "$BUILD")
+          cmake --build "$build" --target veyra_live_stream_tests --parallel 2
+          exe=$(find "$build" -name veyra_live_stream_tests.exe | head -1)
+          test -n "$exe"
+          export PATH="$(cygpath -u "$DEPS")/vcpkg/installed/x64-windows/bin:$PATH"
+          bash tests/data/stream/run-live-stream-tests.sh "$exe" windows_amd64.zip mediamtx.exe
+
+      # Finished recordings are rewritten as standard MP4 (Vegas Pro and other editors refuse fragmented files).
+      # A recording in parts: the files a cut leaves, read back packet by packet (PushPartWriterTests.cpp).
+      - name: Recording MP4 finishing test
+        if: ${{ !cancelled() && steps.buildexe.outcome == 'success' }}
+        run: |
+          $failed = 0
+          foreach ($t in 'veyra_mp4_finalize_tests', 'veyra_push_part_writer_tests') {
+            cmake --build $env:BUILD --target $t --parallel 2
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error::$t did not build"; $failed++; continue }
+            $exe = Get-ChildItem $env:BUILD -Recurse -Filter "$t.exe" | Select-Object -First 1
+            if (-not $exe) { Write-Host "::error::$t.exe not built"; $failed++; continue }
+            $env:PATH = "$env:DEPS\vcpkg\installed\x64-windows\bin;$env:PATH"
+            & $exe.FullName 2>&1 | Out-Host
+            $code = $LASTEXITCODE
+            Write-Host "$t exit $code"
+            if ($code -ne 0) { $failed++ }
+          }
+          if ($failed) { exit 1 }
+
+      # Capture cards without the hardware: media types, strides and colour of what a card delivers, the
+      # Blackmagic and Elgato controls (HDR detection, the 4K X included) against stand-in devices.
+      - name: Capture card format and colour tests
+        if: ${{ !cancelled() && steps.buildexe.outcome == 'success' }}
+        run: |
+          cmake --build $env:BUILD --target veyra_capture_color_tests --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Get-ChildItem $env:BUILD -Recurse -Filter 'veyra_capture_color_tests.exe' | Select-Object -First 1
+          if (-not $exe) { Write-Host "::error::veyra_capture_color_tests.exe not built"; exit 1 }
+          $env:PATH = "$env:DEPS\vcpkg\installed\x64-windows\bin;$env:QT_ROOT_DIR\bin;$env:PATH"
+          & $exe.FullName 2>&1 | Out-Host
+          $code = $LASTEXITCODE
+          Write-Host "veyra_capture_color_tests exit $code"
+          if ($code -ne 0) { exit 1 }
+
+      - name: QML component tests (PushFPS quick setup)
+        if: ${{ !cancelled() && steps.buildexe.outcome == 'success' }}
+        run: |
+          cmake --build $env:BUILD --target veyra_qml_quick_tests veyra_qml_easing_tests --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $stage = Join-Path $env:RUNNER_TEMP 'qml-tests-stage'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          foreach ($t in 'veyra_qml_quick_tests', 'veyra_qml_easing_tests') {
+            $exe = Get-ChildItem $env:BUILD -Recurse -Filter "$t.exe" | Select-Object -First 1
+            if (-not $exe) { Write-Host "::error::$t.exe not built"; exit 1 }
+            Copy-Item $exe.FullName $stage
+          }
+          Copy-Item -Recurse -Force qml (Join-Path $stage 'qml')
+          Copy-Item -Recurse -Force tests\qml\quick (Join-Path $stage 'qml-tests')
+          $env:PATH = "$env:QT_ROOT_DIR\bin;$env:PATH"
+          $env:QML_IMPORT_PATH = "$env:QT_ROOT_DIR\qml"
+          $env:QT_PLUGIN_PATH = "$env:QT_ROOT_DIR\plugins"
+          $env:QT_QUICK_BACKEND = 'software'
+          $env:QML_DISABLE_DISK_CACHE = '1'
+          Push-Location $stage
+          $failed = 0
+          foreach ($t in 'tst_push_quick_setup', 'tst_push_picture_sound', 'tst_push_nis', 'tst_push_optimize', 'tst_push_presets', 'tst_push_appearance', 'tst_push_hud', 'tst_push_plug_and_play', 'tst_push_intro', 'tst_push_stream', 'tst_push_ps5_pairing', 'tst_push_compare', 'tst_push_record', 'tst_push_studio', 'tst_push_watch', 'tst_push_layout', 'tst_push_crop', 'tst_push_frame_input', 'tst_push_tools', 'tst_push_flow2', 'tst_push_diagnose', 'tst_push_read_text', 'tst_push_tour', 'tst_push_pro_panel', 'tst_push_design') {
+            & .\veyra_qml_quick_tests.exe -platform offscreen -input "qml-tests\$t.qml" -o "$t.txt,txt" 2>&1 | Out-Host
+            $code = $LASTEXITCODE
+            Get-Content "$t.txt" -ErrorAction SilentlyContinue | Out-Host
+            if ((Get-Content "$t.txt" -Raw -ErrorAction SilentlyContinue) -notmatch 'Totals: [1-9]\d* passed, 0 failed') { $code = 1 }
+            Write-Host "$t exit $code"
+            if ($code -ne 0) { $failed++ }
+          }
+          Pop-Location
+          if ($failed) { exit 1 }
+
+      - name: QML component tests (whole Veyra suite)
+        if: ${{ !cancelled() && steps.buildexe.outcome == 'success' }}
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP 'qml-tests-stage'
+          $env:PATH = "$env:QT_ROOT_DIR\bin;$env:PATH"
+          $env:QML_IMPORT_PATH = "$env:QT_ROOT_DIR\qml"
+          $env:QT_PLUGIN_PATH = "$env:QT_ROOT_DIR\plugins"
+          $env:QT_QUICK_BACKEND = 'software'
+          $env:QML_DISABLE_DISK_CACHE = '1'
+          Push-Location $stage
+          $env:VEYRA_QML_DIR = Join-Path $stage 'qml'
+          & .\veyra_qml_easing_tests.exe -platform offscreen 2>&1 | Out-Host
+          Write-Host "veyra_qml_easing_tests exit $LASTEXITCODE"
+          $failed = 0
+          foreach ($f in Get-ChildItem qml-tests -Filter 'tst_*.qml') {
+            $res = "result-$($f.BaseName).txt"
+            & .\veyra_qml_quick_tests.exe -platform offscreen -input "qml-tests\$($f.Name)" -o "$res,txt" 2>&1 | Out-Null
+            $code = $LASTEXITCODE
+            $out = Get-Content $res -ErrorAction SilentlyContinue
+            $totals = ($out | Select-String '^Totals:' | Select-Object -Last 1).Line
+            Write-Host ("{0,-34} exit {1}  {2}" -f $f.Name, $code, $totals)
+            if ($code -ne 0) { $failed++; $out | Select-String -Context 0,3 'FAIL!' | Select-Object -First 15 | Out-Host }
+          }
+          Pop-Location
+          Write-Host "files with failures: $failed"
+          if ($failed) { exit 1 }
+
+      - name: Imports must match the upstream runtime package
+        if: ${{ !cancelled() && steps.buildexe.outcome == 'success' }}
+        run: |
+          python -m pip install --quiet pefile
+          @'
+          import pefile, sys
+          pe = pefile.PE(sys.argv[1], fast_load=True)
+          pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
+          names = sorted(e.dll.decode().lower() for e in pe.DIRECTORY_ENTRY_IMPORT)
+          print("\n".join(names))
+          ffmpeg = ("avcodec-", "avformat-", "avutil-", "avfilter-", "avdevice-", "swresample-", "swscale-", "dav1d")
+          app = [n for n in names if n.startswith(("qt6",) + ffmpeg)]
+          expected = {"qt6core.dll","qt6gui.dll","qt6network.dll","qt6qml.dll","qt6quick.dll","qt6widgets.dll",
+                      "avcodec-63.dll","avformat-63.dll","avutil-61.dll","swresample-7.dll","swscale-10.dll"}
+          extra = sorted(set(app) - expected)
+          if extra: sys.exit(f"PushFPS.exe imports libraries the Veyra package does not ship: {extra}")
+          print("OK: every Qt / FFmpeg import is shipped by the Veyra runtime package")
+          '@ | Out-File -Encoding utf8 imports.py
+          python imports.py "$env:BUILD\PushFPS.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Pin the upstream package hashes
+        if: ${{ !cancelled() && steps.buildexe.outcome == 'success' }}
+        run: |
+          gh release download $env:UPSTREAM_TAG -R $env:UPSTREAM_REPO -p SHA256SUMS.txt -O upstream-sha256.txt
+          Get-Content upstream-sha256.txt
+
+      - name: Package the PushFPS release zip
+        id: package
+        if: ${{ !cancelled() && steps.buildexe.outcome == 'success' }}
+        run: |
+          # The licences of the SDK code built into PushFPS.exe travel with it (licenses\sdk in the zip).
+          $sdk = 'licenses\sdk'
+          New-Item -ItemType Directory -Force $sdk | Out-Null
+          Copy-Item "$env:DEPS\dlss\LICENSE.txt" "$sdk\NVIDIA_RTX_SDKs_LICENSE_DLSS_310.9.16.txt"
+          $ffx = Get-ChildItem "$env:DEPS\ffx1" -Recurse -File -Filter 'LICENSE*' | Select-Object -First 1
+          if ($ffx) { Copy-Item $ffx.FullName "$sdk\AMD_FidelityFX_SDK_1.1.4_LICENSE.txt" }
+          $xess = Get-ChildItem "$env:DEPS\xess" -Recurse -File | Where-Object Name -match '^(LICENSE|license)' | Select-Object -First 1
+          if ($xess) { Copy-Item $xess.FullName "$sdk\Intel_XeSS_SDK_3.0.2_LICENSE$($xess.Extension)" }
+          Get-ChildItem $sdk | Format-Table Name, Length
+          if (-not (Test-Path "$sdk\NVIDIA_RTX_SDKs_LICENSE_DLSS_310.9.16.txt")) { throw 'DLSS SDK licence missing' }
+          ./packaging/make-release.ps1 -BuildDir $env:BUILD -Version $env:PUSHFPS_VERSION `
+            -UpstreamRepo $env:UPSTREAM_REPO -UpstreamTag $env:UPSTREAM_TAG -UpstreamSums upstream-sha256.txt -OutDir dist `
+            -PushFlowDir "$env:DEPS\pushflow\runtime\pushflow"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Install test (download Veyra runtime, add PushFPS, start it)
+        if: ${{ !cancelled() && steps.buildexe.outcome == 'success' }}
+        timeout-minutes: 30
+        run: |
+          $zip = (Get-ChildItem dist/PushFPS-*.zip)[0].FullName
+          Expand-Archive $zip -DestinationPath D:\pf-zip
+          & D:\pf-zip\Install-PushFPS.ps1 -Gpu NVIDIA -InstallDir D:\pf-install -NoShortcuts -NoLaunch -ExperimentalExtras No
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path D:\pf-install\PushFPS.exe)) { throw "PushFPS.exe missing after install" }
+          # The runtime package's own launcher and updater update Veyra, not PushFPS: never left in the folder.
+          foreach ($n in 'veyra_qml_ui.exe', 'veyra_update_worker.exe') { if (Test-Path "D:\pf-install\$n") { throw "$n was left in the install" } }
+          if (-not (Test-Path D:\pf-install\avcodec-63.dll)) { throw 'FFmpeg (avcodec-63.dll) missing after install' }
+          # The virtual camera's files are copied apart from the rest (Install-PushFPS.ps1): they have to arrive.
+          foreach ($f in @(Get-ChildItem D:\pf-zip\PushFPS-files\virtualcam -File -ErrorAction SilentlyContinue)) {
+            if (-not (Test-Path (Join-Path D:\pf-install\virtualcam $f.Name))) { throw "the virtual camera file $($f.Name) was not installed" }
+          }
+          # Licensing check: every installed file that says it is from NVIDIA is an NVIDIA-signed original.
+          $bad = Get-ChildItem D:\pf-install -Recurse -File -Include *.dll, *.exe | Where-Object { $_.VersionInfo.CompanyName -match 'NVIDIA' } |
+            Where-Object { $sig = Get-AuthenticodeSignature $_.FullName; -not ($sig.Status -eq 'Valid' -and $sig.SignerCertificate.Subject -match 'NVIDIA') }
+          if ($bad) { $bad | ForEach-Object { Write-Host "::error::not an NVIDIA-signed original: $($_.FullName)" }; throw 'modified NVIDIA files were installed' }
+          Get-Content D:\pf-install\PushFPS-VERSION.txt | Out-Host
+          # AMD package: installs, and carries no NVIDIA AI-enhancement runtime (licensed for NVIDIA graphics only).
+          & D:\pf-zip\Install-PushFPS.ps1 -Gpu AMD -InstallDir D:\pf-install-amd -NoShortcuts -NoLaunch -ExperimentalExtras No
+          if ($LASTEXITCODE -ne 0) { throw "AMD install exit $LASTEXITCODE" }
+          if (-not (Test-Path D:\pf-install-amd\PushFPS.exe)) { throw 'PushFPS.exe missing after the AMD install' }
+          foreach ($d in 'runtime\amd-nr-rdna3', 'runtime\amd-nr') { if (Test-Path "D:\pf-install-amd\$d") { throw "AMD install still has $d" } }
+          $nv = Get-ChildItem D:\pf-install-amd -Recurse -File -Include *.dll, *.exe | Where-Object { $_.VersionInfo.CompanyName -match 'NVIDIA' } |
+            Where-Object { $sig = Get-AuthenticodeSignature $_.FullName; -not ($sig.Status -eq 'Valid' -and $sig.SignerCertificate.Subject -match 'NVIDIA') }
+          if ($nv) { throw 'AMD install has modified NVIDIA files' }
+          Get-Content D:\pf-install-amd\PushFPS-VERSION.txt | Out-Host
+          # Nothing is lost: with -ExperimentalExtras Yes the AMD extras are installed (cached download, no new fetch).
+          & D:\pf-zip\Install-PushFPS.ps1 -Gpu AMD -InstallDir D:\pf-install-amd -NoShortcuts -NoLaunch -ExperimentalExtras Yes
+          if ($LASTEXITCODE -ne 0) { throw "AMD install with extras exit $LASTEXITCODE" }
+          if (-not (Test-Path D:\pf-install-amd\runtime\amd-nr)) { throw 'opt-in extras were not installed' }
+          Remove-Item D:\pf-install-amd -Recurse -Force
+          & D:\pf-zip\Install-PushFPS.ps1 -Gpu NVIDIA -InstallDir D:\pf-install-nvx -NoShortcuts -NoLaunch -ExperimentalExtras Yes
+          if ($LASTEXITCODE -ne 0) { throw "NVIDIA install with extras exit $LASTEXITCODE" }
+          if (-not (Test-Path D:\pf-install-nvx\runtime\experimental\nr-ampere\nvngx_dlssnr.dll)) { throw 'opt-in RTX 30 extra was not installed' }
+          Remove-Item D:\pf-install-nvx -Recurse -Force
+          Write-Host 'Default installs carry only licensed files; the experimental extras install on request.' 
+          # Start it and make sure Windows resolves every DLL and the program reaches its QML session.
+          $p = Start-Process D:\pf-install\PushFPS.exe -PassThru
+          Start-Sleep -Seconds 25
+          $alive = -not $p.HasExited
+          if (-not $alive) { Write-Host "exit code: $($p.ExitCode)" }
+          Get-ChildItem D:\pf-install\logs -ErrorAction SilentlyContinue | ForEach-Object { "=== $($_.Name)"; Get-Content $_.FullName -Tail 60 }
+          if ($alive) { Stop-Process -Id $p.Id -Force }
+          $log = Get-ChildItem D:\pf-install\logs -Filter *.log -ErrorAction SilentlyContinue | Get-Content -Raw
+          if ($log -notmatch 'PushFPS QML session started') { throw "PushFPS did not reach its QML session (no GPU on this runner is fine; a missing DLL or entry point is not)" }
+          $qmlErrors = @(($log -split "`n") | Where-Object { $_ -match '\[ERROR\] \[qml\]' })
+          if ($qmlErrors.Count) { $qmlErrors | ForEach-Object { Write-Host "::error::$_" }; throw "The interface logged QML errors at startup" }
+          Write-Host "PushFPS started and loaded its interface with no QML errors."
+          # Every main page and the capture dialog, each in a fresh profile: no QML errors either.
+          $pages = @(@('--page', 'pro', '--tab', 'fg'), @('--page', 'pro', '--tab', 'quality'), @('--page', 'pro', '--tab', 'display'),
+                     @('--page', 'set'), @('--page', 'min'), @('--page', 'exp'), @('--page', 'live'), @('--page', 'watch'), @('--page', 'home', '--dialog', 'capture'))
+          $i = 0
+          foreach ($pa in $pages) {
+            $i++
+            $env:VEYRA_LOG_FILE = "D:\pf-pages\page-$i.log"
+            New-Item -ItemType Directory -Force D:\pf-pages | Out-Null
+            $q = Start-Process D:\pf-install\PushFPS.exe -PassThru -ArgumentList ($pa + @('--data-dir', "D:\pf-pages\data-$i", '--exit-after', '12000'))
+            if (-not $q.WaitForExit(40000)) { Stop-Process -Id $q.Id -Force }
+            $plog = Get-Content "D:\pf-pages\page-$i.log" -Raw -ErrorAction SilentlyContinue
+            if ($plog -notmatch 'PushFPS QML session started') { throw "$($pa -join ' '): no QML session" }
+            $errs = @(($plog -split "`n") | Where-Object { $_ -match '\[ERROR\] \[qml\]' })
+            if ($errs.Count) { $errs | ForEach-Object { Write-Host "::error::$($pa -join ' '): $_" }; throw "QML errors on $($pa -join ' ')" }
+            Write-Host "$($pa -join ' '): no QML errors"
+          }
+          Remove-Item Env:VEYRA_LOG_FILE
+          # The in-app update path, with the same tools and arguments PushFPS uses (UpdateChecker.cpp
+          # unpackAndLaunch): Windows' tar unpacks the release zip, then the installer from that folder
+          # installs over the running copy's folder and waits for the old process. Only the download
+          # and signature check are left out here (unit-tested in UpdateVerifyTests).
+          $old = Start-Process D:\pf-install\PushFPS.exe -PassThru -ArgumentList @('--data-dir', 'D:\pf-pages\data-update', '--exit-after', '8000')
+          New-Item -ItemType Directory -Force D:\pf-update\files | Out-Null
+          & "$env:SystemRoot\System32\tar.exe" -xf $zip -C D:\pf-update\files
+          if ($LASTEXITCODE -ne 0) { throw "tar could not unpack the release zip (exit $LASTEXITCODE)" }
+          if (-not (Test-Path D:\pf-update\files\Install-PushFPS.ps1)) { throw 'the installer is not at the top of the release zip' }
+          Set-Content D:\pf-install\PushFPS-update-marker.txt 'kept'
+          Set-Content D:\pf-update\empty.txt ''
+          # The virtual camera's file as it is while another program has it loaded: it cannot be written over, it
+          # can be renamed. Until 23 November 2026 that ended an install with "Copying files failed" and left the
+          # folder half old and half new (the owner's PC, with a browser open). The install must finish, with the
+          # new file under the old name and the old one moved aside.
+          $cam = 'D:\pf-install\virtualcam\pushfps-virtualcam64.dll'; $camHeld = $null
+          if (Test-Path $cam) { $camHeld = [System.IO.File]::Open($cam, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]'Read, Delete') }
+          $u = Start-Process powershell.exe -PassThru -Wait -RedirectStandardInput D:\pf-update\empty.txt -RedirectStandardOutput D:\pf-update\out.txt -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'D:\pf-update\files\Install-PushFPS.ps1',
+            '-Gpu', 'NVIDIA', '-InstallDir', 'D:\pf-install', '-NoShortcuts', '-ExperimentalExtras', 'No', '-WaitForPid', "$($old.Id)", '-NoLaunch')
+          Get-Content D:\pf-update\out.txt -ErrorAction SilentlyContinue | Out-Host
+          if ($u.ExitCode -ne 0) { throw "the update install failed (exit $($u.ExitCode))" }
+          if (-not $old.HasExited) { throw 'the installer did not wait for the running PushFPS' }
+          if (-not (Test-Path D:\pf-install\PushFPS-update-marker.txt)) { throw 'the update removed a file it should have kept' }
+          if ((Get-Content D:\pf-install\PushFPS-VERSION.txt -Raw) -notmatch "PushFPS $([regex]::Escape($env:PUSHFPS_VERSION))") { throw 'PushFPS-VERSION.txt does not name this version after the update' }
+          if ($camHeld) {
+            $camHeld.Dispose()
+            if (@(Get-ChildItem D:\pf-install\virtualcam -Filter 'pushfps-virtualcam64.dll.replaced-*').Count -ne 1) { throw 'the virtual camera file that another program held was not moved aside' }
+            if ((Get-FileHash $cam -Algorithm SHA256).Hash -ne (Get-FileHash D:\pf-update\files\PushFPS-files\virtualcam\pushfps-virtualcam64.dll -Algorithm SHA256).Hash) { throw 'the virtual camera file was not replaced while another program held it' }
+            Write-Host 'Update path: a virtual camera file held by another program is moved aside and replaced; the install finishes.'
+          } else { Write-Host '::warning::no virtual camera file in this package: the held-file path of the installer was not run' }
+          Write-Host 'Update path: tar unpack, install over the old copy while it closes, version record written.'
+          # A build that is not a release never installs over the PushFPS that is there (Install-PushFPS.ps1,
+          # $OwnFolder; 23 November 2026: a private test build, double-clicked, replaced the owner's own PushFPS).
+          # Run the way a double click runs it, with no folder named: its own folder, its own shortcuts, a copy of
+          # the settings, and the installed PushFPS's folder exactly as it was. A release build keeps the default.
+          if ($env:PUSHFPS_VERSION -notmatch '^\d+\.\d+\.\d+$') {
+            $main = "$env:LOCALAPPDATA\Programs\PushFPS"; $own = "$env:LOCALAPPDATA\Programs\PushFPS-test"
+            if ((Test-Path $main) -or (Test-Path $own)) { throw 'the runner already has a PushFPS folder: this test would not be its own' }
+            $desk = [Environment]::GetFolderPath('Desktop'); $menu = [Environment]::GetFolderPath('Programs')
+            New-Item -ItemType Directory -Force $desk, $menu, "$main\runtime_local\user-data-2.0.0" | Out-Null
+            Set-Content "$main\runtime_local\user-data-2.0.0\ci-settings.txt" 'from the installed PushFPS'
+            Set-Content "$main\ci-main.txt" 'the installed PushFPS'
+            & D:\pf-zip\Install-PushFPS.ps1 -Gpu NVIDIA -NoLaunch -ExperimentalExtras No
+            if ($LASTEXITCODE -ne 0) { throw "a test build's install into its own folder failed (exit $LASTEXITCODE)" }
+            if (-not (Test-Path "$own\PushFPS.exe")) { throw 'a test build did not install into its own folder' }
+            $mainFiles = @(Get-ChildItem $main -Recurse -File | ForEach-Object { $_.FullName.Substring($main.Length) } | Sort-Object)
+            if (($mainFiles -join '|') -ne '\ci-main.txt|\runtime_local\user-data-2.0.0\ci-settings.txt') { throw "a test build changed the folder of the installed PushFPS: $($mainFiles -join ', ')" }
+            if ((Get-Content "$own\runtime_local\user-data-2.0.0\ci-settings.txt" -Raw) -notmatch 'from the installed PushFPS') { throw 'a test build did not take a copy of the settings' }
+            foreach ($folder in $desk, $menu) {
+              if (Test-Path (Join-Path $folder 'PushFPS.lnk')) { throw "a test build wrote the installed PushFPS's shortcut in $folder" }
+              if (-not (Test-Path (Join-Path $folder 'PushFPS test.lnk'))) { throw "a test build has no shortcut of its own in $folder" }
+            }
+            # Installed again: the settings it has by then are its own and stay.
+            Set-Content "$own\runtime_local\user-data-2.0.0\ci-settings.txt" 'changed in the test build'
+            Set-Content "$main\runtime_local\user-data-2.0.0\ci-settings.txt" 'changed in the installed PushFPS'
+            & D:\pf-zip\Install-PushFPS.ps1 -Gpu NVIDIA -NoShortcuts -NoLaunch -ExperimentalExtras No
+            if ($LASTEXITCODE -ne 0) { throw "a test build's second install failed (exit $LASTEXITCODE)" }
+            if ((Get-Content "$own\runtime_local\user-data-2.0.0\ci-settings.txt" -Raw) -notmatch 'changed in the test build') { throw 'a second install replaced the test build''s own settings' }
+            & D:\pf-zip\Install-PushFPS.ps1 -Uninstall
+            if ($LASTEXITCODE -ne 0) { throw "a test build's uninstall failed (exit $LASTEXITCODE)" }
+            if (Test-Path $own) { throw 'the uninstall left the test build''s folder' }
+            if (-not (Test-Path "$main\ci-main.txt")) { throw 'a test build''s uninstall removed the installed PushFPS' }
+            foreach ($folder in $desk, $menu) { if (Test-Path (Join-Path $folder 'PushFPS test.lnk')) { throw "the uninstall left a shortcut in $folder" } }
+            Remove-Item $main -Recurse -Force
+            Write-Host 'Test build: its own folder and shortcuts, a copy of the settings once, the installed PushFPS untouched; uninstall removes only itself.'
+          }
+
+      # Corresponding source of the streaming libraries compiled into PushFPS.exe: Chiaki-ng with
+      # Veyra's patches applied (AGPL-3.0 with the OpenSSL exception), moonlight-common-c with ENet
+      # and nanors (GPL-3.0 / MIT), and the vcpkg recipes of the static libraries (OpenSSL, Opus,
+      # SDL3, libdatachannel and the rest, MPL-2.0 / BSD / MIT / zlib) at the pinned vcpkg commit.
+      - name: Streaming source archive
+        run: |
+          $src = Join-Path $env:RUNNER_TEMP "PushFPS-$env:PUSHFPS_VERSION-streaming-source"
+          New-Item -ItemType Directory -Force $src | Out-Null
+          robocopy "$env:DEPS\chiaki-stage" "$src\chiaki-ng" /E /XD .git android switch /XF .git /NFL /NDL /NJH /NJS | Out-Null
+          robocopy "$env:DEPS\moonlight-common-c" "$src\moonlight-common-c" /E /XD .git /XF .git /NFL /NDL /NJH /NJS | Out-Null
+          robocopy "$env:DEPS\vcpkg\ports" "$src\vcpkg-ports" /E /NFL /NDL /NJH /NJS | Out-Null
+          robocopy scripts\xbox\vcpkg-overlay "$src\vcpkg-overlay" /E /NFL /NDL /NJH /NJS | Out-Null
+          @"
+          Corresponding source for the streaming libraries in PushFPS $env:PUSHFPS_VERSION
+          chiaki-ng           https://github.com/streetpea/chiaki-ng  $env:CHIAKI_COMMIT  + scripts/remoteplay/patches (applied here)
+          moonlight-common-c  https://github.com/moonlight-stream/moonlight-common-c  $env:MOONLIGHT_COMMIT (with submodules)
+          vcpkg               https://github.com/microsoft/vcpkg  $env:VCPKG_COMMIT  (vcpkg-ports: the recipes used, triplet x64-windows-static)
+          vcpkg-overlay       PushFPS/Veyra overlay for libjuice (scripts/xbox/vcpkg-overlay)
+          Installed packages:
+          "@ | Set-Content "$src\SOURCES.txt" -Encoding utf8
+          & "$env:DEPS\vcpkg\vcpkg.exe" list --x-install-root="$env:DEPS\stream-installed" | Add-Content "$src\SOURCES.txt"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $zip = "dist\PushFPS-$env:PUSHFPS_VERSION-streaming-source.zip"
+          Compress-Archive -Path "$src\*" -DestinationPath $zip -Force
+          (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() + "  " + (Split-Path $zip -Leaf) | Set-Content "$zip.sha256" -Encoding ascii
+          Get-Item $zip | Format-List Name, Length
+
+      # The package is kept whenever it was made, also from a run in which a check failed: the screenshot workflow
+      # can then show such a build (its run_id input). Nothing is released from a failed run: the release job
+      # needs this job to succeed.
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
+        with:
+          name: PushFPS-${{ env.PUSHFPS_VERSION }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error

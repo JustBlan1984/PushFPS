@@ -150,6 +150,12 @@ target_compile_features(veyra_export_timeline_tests PRIVATE cxx_std_20)
 target_link_libraries(veyra_export_timeline_tests PRIVATE veyra_base)
 veyra_apply_warnings(veyra_export_timeline_tests)
 
+# Runtime selection regression: CPU/filesystem only, no GPU or proprietary headers.
+add_executable(veyra_dlss_runtime_selection_tests tests/unit/DlssRuntimeSelectionTests.cpp)
+target_compile_features(veyra_dlss_runtime_selection_tests PRIVATE cxx_std_20)
+target_include_directories(veyra_dlss_runtime_selection_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+veyra_apply_warnings(veyra_dlss_runtime_selection_tests)
+
 add_library(veyra_gfx STATIC
   src/gfx/GpuSchedulingPriority.cpp
   src/gfx/NvidiaVrrProfile.cpp
@@ -204,7 +210,7 @@ endif()
 # ---------------------------------------------------------------------------
 if(VEYRA_ENABLE_EXPERIMENTAL_DLSSNR)
   if(NOT VEYRA_DLSS_SDK_ROOT OR NOT EXISTS "${VEYRA_DLSS_SDK_ROOT}/include/nvsdk_ngx.h")
-    message(FATAL_ERROR "VEYRA_ENABLE_EXPERIMENTAL_DLSSNR requires VEYRA_DLSS_SDK_ROOT pointing at NVIDIA DLSS SDK 310.7 (include/nvsdk_ngx.h missing)")
+    message(FATAL_ERROR "VEYRA_ENABLE_EXPERIMENTAL_DLSSNR requires VEYRA_DLSS_SDK_ROOT pointing at NVIDIA DLSS SDK (include/nvsdk_ngx.h missing)")
   endif()
 add_library(veyra_ngx STATIC
   src/ngx/NgxCoreHost.cpp
