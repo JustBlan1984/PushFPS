@@ -105,7 +105,7 @@
 +            ..Default::default()
 +        };
 +        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
-+            return Err(windows::core::Error::from_win32());
++            return Err(windows::core::Error::from_thread());
 +        }
 +        let rect = info.rcMonitor;
 +        let sw = (rect.right - rect.left) as u32;
