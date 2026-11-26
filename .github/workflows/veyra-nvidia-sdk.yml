@@ -1,11 +1,11 @@
 # Builds the complete upstream Veyra 2.2.1 application with current NVIDIA SDKs.
 # The existing installation supplies unchanged vendor runtimes; updated DLSS DLLs
 # download directly from NVIDIA during installation. No SDK headers or DLLs are published.
-name: Veyra 2.2.1 NVIDIA SDK update
+name: Veyra 2.2.1 engine optimization experiment
 
 on:
   push:
-    branches: ['veyra/2.2.1-nvidia-sdk']
+    branches: ['veyra/2.2.1-engine-opt']
   workflow_dispatch:
 
 permissions:
@@ -16,7 +16,7 @@ permissions:
 # build of the same commit; GitHub cancels an older *pending* run when a newer one queues in the same
 # group, and a cancelled push run makes the README build badge read "failing".
 concurrency:
-  group: veyra-nvidia-sdk-${{ github.ref }}
+  group: veyra-engine-opt-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -76,7 +76,7 @@ jobs:
           git diff --stat
       - name: Version and source identity
         run: |
-          "VEYRA_BUILD_VERSION=2.2.1-nvidia-sdk.$env:GITHUB_RUN_NUMBER" | Out-File -Append $env:GITHUB_ENV
+          "VEYRA_BUILD_VERSION=2.2.1-engine-opt.$env:GITHUB_RUN_NUMBER" | Out-File -Append $env:GITHUB_ENV
           New-Item -ItemType Directory -Force $env:DEPS | Out-Null
           git rev-parse HEAD
           git status --short
@@ -322,6 +322,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & D:\sdk-tests\nvenc-contract.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cl /nologo /std:c++20 /EHsc /W4 /I include tests/unit/NativePresentWorkerTests.cpp /Fe:D:\sdk-tests\native-present-worker.exe /Fo:D:\sdk-tests\native-present-worker.obj
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & D:\sdk-tests\native-present-worker.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build Veyra with current NVIDIA SDK headers and libraries
         timeout-minutes: 15
@@ -337,7 +341,7 @@ jobs:
         timeout-minutes: 15
         run: |
           $env:PATH = "$env:DEPS\vcpkg\installed\x64-windows\bin;$env:QT_ROOT_DIR\bin;$env:PATH"
-          foreach ($target in 'veyra_parity_tests','veyra_unified_tests','veyra_pipeline_tests','veyra_frame_pacing_repair_tests','veyra_nvenc_tuning_tests') {
+          foreach ($target in 'veyra_parity_tests','veyra_unified_tests','veyra_pipeline_tests','veyra_frame_pacing_repair_tests','veyra_nvenc_tuning_tests','veyra_presentation_worker_tests','veyra_live_timing_tests','veyra_realtime_preview_tests','veyra_repair_contract_tests') {
             cmake --build $env:BUILD --target $target --parallel 2
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             $exe = Get-ChildItem $env:BUILD -Recurse -Filter "$target.exe" | Select-Object -First 1
@@ -414,7 +418,12 @@ jobs:
           @{version=$env:VEYRA_BUILD_VERSION;source='https://github.com/Likely7/Veyra-NRVideo/tree/b9cc86aa9f68462ea740afe6104db4d5ce227aeb';dlssSdk='310.9.16';videoCodecSdk='13.1.15';files=$files} |
             ConvertTo-Json -Depth 5 | Set-Content "$root\update-manifest.json" -Encoding UTF8
           @"
-          Veyra 2.2.1 NVIDIA SDK update for RTX 50-series.
+          Veyra 2.2.1 engine optimization EXPERIMENT for RTX 50-series.
+          Includes the previously verified NVIDIA SDK updates.
+          Native presentation worker is limited to GPU-ready capture FG frames without active recording/replay or a custom output cap.
+          It supports SDR and HDR; XeSS, files, recording and custom output caps retain the owner-thread path.
+          Worker timing is logged under native-present-worker. Set VEYRA_DISABLE_NATIVE_PRESENT_WORKER=1 before launch for a baseline comparison.
+          CPU tests and startup do not establish a PS5 latency or smoothness improvement.
           Close Veyra, then double-click Install-Update.cmd.
           No backups or rollback files are created. Verified temporary downloads are removed after installation.
           This is a custom build. Source: https://github.com/Likely7/Veyra-NRVideo/tree/b9cc86aa9f68462ea740afe6104db4d5ce227aeb
@@ -455,7 +464,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Veyra-NVIDIA-SDK-update
+          name: Veyra-engine-optimization-experiment
           path: |
             dist/*.zip
             dist/*.sha256
