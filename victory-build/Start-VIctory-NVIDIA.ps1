@@ -45,6 +45,9 @@ if($Mode -eq 'Safe'){
 }else{
     # The pinned fork's faster profile; residency guards remain enabled.
     $settings.VICTORY_THIN='1'; $settings.VICTORY_JOIN_PARTS='8'; $settings.VICTORY_UPLOAD_AHEAD='1'
+    # Let the GPU use the shared graphics constants heap when its driver accepts it.
+    $settings.VICTORY_PORT_CONSTANTS='1'
+    $settings.VICTORY_FRAME_INTERVAL_MS='16.667'
 }
 if($RayTracing){$settings.VICTORY_BVH_BUILDER='1'}
 if($Action -eq 'Play'){
