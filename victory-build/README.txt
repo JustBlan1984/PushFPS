@@ -14,7 +14,8 @@ Launch-VIctory-1440p-RT.cmd:
   2560x1440 output, RTX 5070 Ti, ray tracing ON, borderless fullscreen with
   centered aspect-preserving presentation and black side bars on ultrawide.
   Optimized play also requests the shared constants heap (renderer port 1)
-  and a 60 Hz title frame interval. Achieved frame rate depends on the scene.
+  and GPU comparison of eligible buffers starting at 1 MiB, within the
+  runtime-selected memory budget. The title targets a 60 Hz frame interval.
   Uses the pinned fork's faster profile (THIN=1, JOIN_PARTS=8, UPLOAD_AHEAD=1).
   This is an upstream optimization profile, not a verified NVIDIA speedup.
   Memory-residency protection remains enabled. Alt+Tab returns to the desktop.

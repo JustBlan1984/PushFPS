@@ -47,6 +47,8 @@ if($Mode -eq 'Safe'){
     $settings.VICTORY_THIN='1'; $settings.VICTORY_JOIN_PARTS='8'; $settings.VICTORY_UPLOAD_AHEAD='1'
     # Let the GPU use the shared graphics constants heap when its driver accepts it.
     $settings.VICTORY_PORT_CONSTANTS='1'
+    # Move eligible 1-4 MiB copies to the card within the adapter's existing budget.
+    $settings.VICTORY_CARD_BUFFERS_MIN_MB='1'
     $settings.VICTORY_FRAME_INTERVAL_MS='16.667'
 }
 if($RayTracing){$settings.VICTORY_BVH_BUILDER='1'}
