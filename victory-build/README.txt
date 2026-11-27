@@ -1,4 +1,4 @@
-VIctory 14900K / RTX 5070 Ti trial - revision 2
+VIctory 14900K / RTX 5070 Ti trial - revision 3
 
 Source: https://github.com/Belobug/VIctory-Belobug-AMD/tree/cd8dfc06ace7ccb91a19431e74bc2d0de2a10145
 License: GPL-3.0-or-later. Local modifications are supplied in fullscreen.patch.
@@ -14,7 +14,11 @@ Launch-VIctory-1440p-RT.cmd:
   Uses the pinned fork's faster profile (THIN=1, JOIN_PARTS=8, UPLOAD_AHEAD=1).
   This is an upstream optimization profile, not a verified NVIDIA speedup.
   Memory-residency protection remains enabled. Alt+Tab returns to the desktop.
-  The fullscreen monitor is selected from the cursor when the window opens.
+  Fullscreen uses the original Americas window on the Windows primary display.
+  To compare memory refresh strategies, open a terminal in this folder and run
+    .\Launch-VIctory-1440p-RT.cmd -CompareRefresh
+  Play the same scene for at least two minutes. The log prints median and p90
+  frame times for alternating 20-second phases with the guard off and on.
 
 Launch-VIctory-Safe-1440p-RT.cmd:
   Same output, ray tracing and fullscreen, with the earlier conservative

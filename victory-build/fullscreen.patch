@@ -8,16 +8,17 @@
  ] }
 --- a/crates/victory-gpu/src/host.rs
 +++ b/crates/victory-gpu/src/host.rs
-@@ -17,6 +17,8 @@
+@@ -17,6 +17,9 @@
  use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
  use windows::Win32::UI::WindowsAndMessaging::*;
  use windows::core::{Interface, PCWSTR, w};
 +
 +mod fullscreen;
++pub use fullscreen::attach_title_fullscreen;
  
  /// Resource states without the console's own bits (compression hints from
  /// bit 25 up), which the host rejects.
-@@ -9928,9 +9930,13 @@
+@@ -9928,9 +9931,14 @@
          height: u32,
          format: DXGI_FORMAT,
      ) -> windows::core::Result<Presenter> {
@@ -25,119 +26,103 @@
 -            Some(hwnd) => hwnd,
 -            None => window(width, height)?,
 +        let hwnd = if fullscreen::enabled() {
-+            window(width, height)?
++            fullscreen::target().ok_or_else(|| windows::core::Error::from_hresult(
++                windows::Win32::Foundation::E_PENDING,
++            ))?
++        } else if let Some(hwnd) = title_window() {
++            hwnd
 +        } else {
-+            match title_window() {
-+                Some(hwnd) => hwnd,
-+                None => window(width, height)?,
-+            }
++            window(width, height)?
          };
          self.log_video_memory("right before the swap chain is made");
          // SAFETY: plain object creation for our window.
-@@ -10509,6 +10515,9 @@
- }
- 
- fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
-+    if fullscreen::enabled() {
-+        return fullscreen::make(width, height);
-+    }
-     const CLASS: PCWSTR = w!("VIctory");
-     // SAFETY: registers our class once and creates a window of it.
-     unsafe {
 --- /dev/null
 +++ b/crates/victory-gpu/src/host/fullscreen.rs
-@@ -0,0 +1,91 @@
-+//! A black monitor-sized parent with an aspect-fitted presentation child.
-+//! The swap chain still contains the title's original render size; no extra
-+//! GPU render target or stretch of the title's camera is required.
-+
-+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-+use windows::Win32::Graphics::Gdi::{
-+    BLACK_BRUSH, GetMonitorInfoW, GetStockObject, HBRUSH, MONITORINFO,
-+    MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint,
-+};
+@@ -0,0 +1,84 @@
++//! Present inside the title's top-level window, on its owning UI thread.
++use std::sync::atomic::{AtomicUsize, Ordering};
++use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
++use windows::Win32::Graphics::Gdi::{BLACK_BRUSH, GetStockObject, HBRUSH};
 +use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-+use windows::Win32::UI::HiDpi::{
-+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
-+};
 +use windows::Win32::UI::WindowsAndMessaging::*;
 +use windows::core::w;
 +
 +mod geometry;
-+use geometry::fit;
++static TARGET: AtomicUsize = AtomicUsize::new(0);
 +
 +pub(super) fn enabled() -> bool {
 +    std::env::var_os("VICTORY_FULLSCREEN").is_some_and(|v| v == "1")
 +}
 +
-+extern "system" fn procedure(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-+    // SAFETY: Windows supplies these window-procedure arguments.
++pub(super) fn target() -> Option<HWND> {
++    let h = TARGET.load(Ordering::Acquire);
++    (h != 0).then_some(HWND(h as *mut _))
++}
++
++extern "system" fn child_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
++    if message == WM_NCHITTEST {
++        // Both children and the title belong to the same thread. Pass mouse
++        // input through to the original title window.
++        return LRESULT(HTTRANSPARENT as i32 as isize);
++    }
++    if message == WM_NCDESTROY {
++        let _ = TARGET.compare_exchange(hwnd.0 as usize, 0, Ordering::AcqRel, Ordering::Relaxed);
++    }
 +    unsafe { DefWindowProcW(hwnd, message, wp, lp) }
 +}
 +
-+pub(super) fn make(width: u32, height: u32) -> windows::core::Result<HWND> {
-+    if width == 0 || height == 0 {
-+        return Err(windows::core::Error::empty());
-+    }
-+    // SAFETY: all handles belong to this window thread; the parent owns the
-+    // child. The class's stock background brush is owned by Windows.
-+    unsafe {
-+        // This thread lives only for these windows. Physical monitor pixels
-+        // prevent desktop scaling from clipping a 1440p client area.
-+        let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-+        let instance = GetModuleHandleW(None)?;
-+        let name = w!("VIctoryAspectFullscreen");
-+        let class = WNDCLASSEXW {
-+            cbSize: size_of::<WNDCLASSEXW>() as u32,
-+            lpfnWndProc: Some(procedure),
-+            hInstance: instance.into(),
-+            lpszClassName: name,
-+            hCursor: LoadCursorW(None, IDC_ARROW)?,
-+            hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
-+            ..Default::default()
-+        };
-+        RegisterClassExW(&class);
-+        let mut cursor = POINT::default();
-+        let _ = GetCursorPos(&mut cursor);
-+        let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
-+        let mut info = MONITORINFO {
-+            cbSize: size_of::<MONITORINFO>() as u32,
-+            ..Default::default()
-+        };
-+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
-+            return Err(windows::core::Error::from_thread());
-+        }
-+        let rect = info.rcMonitor;
-+        let sw = (rect.right - rect.left) as u32;
-+        let sh = (rect.bottom - rect.top) as u32;
-+        if sw == 0 || sh == 0 {
-+            return Err(windows::core::Error::empty());
-+        }
-+        let parent = CreateWindowExW(
-+            WINDOW_EX_STYLE(0), name, w!("VIctory - fullscreen"),
-+            WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN,
-+            rect.left, rect.top, sw as i32, sh as i32,
-+            None, None, Some(instance.into()), None,
-+        )?;
-+        let (x, y, w, h) = fit(width, height, sw, sh);
-+        let child = CreateWindowExW(
-+            WINDOW_EX_STYLE(0), name, w!("VIctory"), WS_CHILD | WS_VISIBLE,
-+            x, y, w, h, Some(parent), None, Some(instance.into()), None,
-+        );
-+        let child = match child {
-+            Ok(child) => child,
-+            Err(error) => {
-+                let _ = DestroyWindow(parent);
-+                return Err(error);
-+            }
-+        };
-+        let _ = SetForegroundWindow(parent);
-+        tracing::info!(width, height, screen_width=sw, screen_height=sh, x, y,
-+            viewport_width=w, viewport_height=h, "aspect-preserving borderless fullscreen");
-+        Ok(child)
++/// Called with a live title HWND from its window-creation hook.
++pub fn attach_title_fullscreen(handle: usize) {
++    if target().is_some() { return; }
++    if let Err(error) = attach(HWND(handle as *mut _)) {
++        TARGET.store(handle, Ordering::Release);
++        tracing::warn!(%error, "fullscreen unavailable; using the original title window");
 +    }
 +}
 +
++fn attach(title: HWND) -> windows::core::Result<()> {
++    // Use the coordinate system of the title's own UI thread for both the
++    // primary screen and its child windows, including under desktop scaling.
++    unsafe {
++        let sw = GetSystemMetrics(SM_CXSCREEN);
++        let sh = GetSystemMetrics(SM_CYSCREEN);
++        if sw <= 0 || sh <= 0 { return Err(windows::core::Error::empty()); }
++        let instance = GetModuleHandleW(None)?;
++        let class = w!("VIctoryAspectChild");
++        RegisterClassExW(&WNDCLASSEXW {
++            cbSize: size_of::<WNDCLASSEXW>() as u32,
++            lpfnWndProc: Some(child_proc),
++            hInstance: instance.into(),
++            lpszClassName: class,
++            hCursor: LoadCursorW(None, IDC_ARROW)?,
++            hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
++            ..Default::default()
++        });
++        // All output modes exposed by this build have a 16:9 aspect.
++        let (x, y, w, h) = geometry::fit(16, 9, sw as u32, sh as u32);
++        let backdrop = CreateWindowExW(WS_EX_NOPARENTNOTIFY, class, w!(""),
++            WS_CHILD | WS_CLIPCHILDREN, 0, 0, sw, sh, Some(title), None, Some(instance.into()), None)?;
++        let viewport = match CreateWindowExW(WS_EX_NOPARENTNOTIFY, class, w!(""), WS_CHILD | WS_VISIBLE,
++            x, y, w, h, Some(backdrop), None, Some(instance.into()), None) {
++            Ok(viewport) => viewport,
++            Err(error) => { let _ = DestroyWindow(backdrop); return Err(error); }
++        };
++        let old = GetWindowLongPtrW(title, GWL_STYLE);
++        let style = (old as u32 & !WS_OVERLAPPEDWINDOW.0) | WS_POPUP.0 | WS_CLIPCHILDREN.0;
++        SetWindowLongPtrW(title, GWL_STYLE, style as isize);
++        if let Err(error) = SetWindowPos(title, None, 0, 0, sw, sh,
++            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED) {
++            SetWindowLongPtrW(title, GWL_STYLE, old);
++            let _ = DestroyWindow(backdrop);
++            return Err(error);
++        }
++        let _ = ShowWindow(backdrop, SW_SHOWNA);
++        TARGET.store(viewport.0 as usize, Ordering::Release);
++        tracing::info!(screen_width=sw, screen_height=sh, x,y, viewport_width=w, viewport_height=h,
++            "aspect-preserving borderless fullscreen on original title window");
++        Ok(())
++    }
++}
 --- /dev/null
 +++ b/crates/victory-gpu/src/host/fullscreen/geometry.rs
 @@ -0,0 +1,29 @@
@@ -170,3 +155,86 @@
 +        assert_eq!(fit(1920, 1080, 1080, 1920), (0, 656, 1080, 607));
 +    }
 +}
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -47,6 +47,8 @@
+ mod book;
+ #[cfg(windows)]
+ mod host;
++#[cfg(windows)]
++pub use host::attach_title_fullscreen;
+ #[cfg(windows)]
+ mod indirect;
+ #[cfg(windows)]
+--- a/crates/victory-hle/src/modules/lifecycle.rs
++++ b/crates/victory-hle/src/modules/lifecycle.rs
+@@ -238,6 +238,21 @@
+         wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
+         wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
+     }
++    maybe_attach_fullscreen(hwnd);
++}
++
++fn maybe_attach_fullscreen(hwnd: HWND) {
++    if !std::env::var_os("VICTORY_FULLSCREEN").is_some_and(|v| v == "1") { return; }
++    // The hook runs on the thread that owns this live title window.
++    unsafe {
++        if wm::GetWindowLongPtrW(hwnd, wm::GWL_STYLE) as u32 & wm::WS_CHILD != 0
++            || !wm::GetWindow(hwnd, wm::GW_OWNER).is_null() { return; }
++        let mut caption = [0u16; 64];
++        let n = wm::GetWindowTextW(hwnd, caption.as_mut_ptr(), caption.len() as i32);
++        if String::from_utf16_lossy(&caption[..n as usize]).eq_ignore_ascii_case("Americas") {
++            victory_gpu::attach_title_fullscreen(hwnd as usize);
++        }
++    }
+ }
+ 
+ extern "system" fn window_proc(
+@@ -268,7 +283,11 @@
+             wm::RemovePropW(hwnd, TITLE_PROC);
+         }
+         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
+-        wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
++        let result = wm::CallWindowProcW(title, hwnd, message, wparam, lparam);
++        if message == wm::WM_SETTEXT && result != 0 {
++            maybe_attach_fullscreen(hwnd);
++        }
++        result
+     }
+ }
+ 
+@@ -532,6 +551,34 @@
+     }
+ 
+     #[test]
++    #[ignore = "requires a Windows desktop and VICTORY_FULLSCREEN=1"]
++    fn fullscreen_americas_uses_one_top_level() {
++        assert_eq!(std::env::var("VICTORY_FULLSCREEN").as_deref(), Ok("1"));
++        let null = std::ptr::null_mut();
++        let title = CreateWindowExW(0, w!("STATIC"), w!("starting"), wm::WS_OVERLAPPEDWINDOW,
++            20, 20, 800, 600, null, null, null, std::ptr::null());
++        assert!(!title.is_null());
++        unsafe {
++            wm::SetWindowTextW(title, w!("Americas"));
++            let class = w!("VIctoryAspectChild");
++            let back = wm::FindWindowExW(title, null, class, std::ptr::null());
++            assert!(!back.is_null());
++            let view = wm::FindWindowExW(back, null, class, std::ptr::null());
++            assert!(!view.is_null());
++            assert_eq!(wm::GetAncestor(view, wm::GA_ROOT), title);
++            wm::SetWindowTextW(title, w!("Americas"));
++            assert!(wm::FindWindowExW(title, back, class, std::ptr::null()).is_null());
++            let mut rect = RECT::default();
++            assert_ne!(wm::GetWindowRect(title, &mut rect), 0);
++            assert_eq!((rect.left, rect.top, rect.right, rect.bottom),
++                (0, 0, wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN)));
++            assert!(!wm::GetPropW(title, TITLE_PROC).is_null());
++            assert_ne!(wm::DestroyWindow(title), 0);
++            assert_eq!(wm::IsWindow(view), 0);
++        }
++    }
++
++    #[test]
+     fn hooked_windows_still_reach_the_title_procedure() {
+         let null = std::ptr::null_mut();
+         let hwnd = CreateWindowExW(

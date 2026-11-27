@@ -50,7 +50,7 @@ jobs:
       - name: Apply reviewed local presentation patch
         run: |
           $patch = "$env:GITHUB_WORKSPACE\build-scripts\victory-build\fullscreen.patch"
-          foreach ($file in @('crates/victory-gpu/Cargo.toml','crates/victory-gpu/src/host.rs',$patch)) {
+          foreach ($file in @('crates/victory-gpu/Cargo.toml','crates/victory-gpu/src/host.rs','crates/victory-gpu/src/lib.rs','crates/victory-hle/src/modules/lifecycle.rs',$patch)) {
             $absolute = (Resolve-Path -LiteralPath $file).Path
             $text = [IO.File]::ReadAllText($absolute).Replace("`r`n","`n")
             [IO.File]::WriteAllText($absolute,$text,[Text.UTF8Encoding]::new($false))
@@ -69,6 +69,12 @@ jobs:
         timeout-minutes: 20
         run: |
           cargo test --locked --profile diag -p victory-core -p victory-pe -p victory-game
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test fullscreen with an original Windows title window
+        env:
+          VICTORY_FULLSCREEN: '1'
+        run: |
+          cargo test --locked --profile diag -p victory-hle --lib fullscreen_americas_uses_one_top_level -- --ignored
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Select an Intel hybrid CPU code-generation target
         run: |
@@ -101,7 +107,7 @@ jobs:
             commit='cd8dfc06ace7ccb91a19431e74bc2d0de2a10145'
             cpuTarget=$env:VICTORY_CPU_TARGET
             gpuTarget='NVIDIA GeForce RTX 5070 Ti; runtime rendering performance unverified'
-            packageRevision='fullscreen-pipeline-warmup-v2'
+            packageRevision='single-window-refresh-ab-v3'
             buildScriptsCommit=$env:GITHUB_SHA
             rust=(rustc --version)
             gameFilesIncluded=$false

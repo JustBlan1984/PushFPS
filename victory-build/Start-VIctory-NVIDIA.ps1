@@ -5,6 +5,7 @@ param(
     [ValidateSet('Optimized','Safe')][string]$Mode='Optimized',
     [switch]$Windowed,
     [switch]$Profile,
+    [switch]$CompareRefresh,
     [switch]$RayTracing=$true
 )
 $ErrorActionPreference='Stop'
@@ -45,6 +46,10 @@ if($Action -eq 'Play'){
     $settings.VICTORY_PIPELINE_BOOK='1'
     $settings.VICTORY_TIMER_LOG='1'
     $settings.VICTORY_MEMORY_CATEGORIES='1'
+    if($CompareRefresh){
+        $settings.VICTORY_AB='20,VICTORY_PORT_GUARD'
+        Write-Host 'Refresh comparison enabled. Keep the same gameplay scene for at least two minutes.'
+    }
     if($Profile){$settings.VICTORY_PROFILE="60,120,20,$logs\profile-$stamp.txt"}
 }
 foreach($key in $settings.Keys){Set-Item "Env:$key" $settings[$key]}
