@@ -13,7 +13,8 @@ $ErrorActionPreference='Stop'
 if($CompareCopyOrder -and ($CompareRefresh -or $Profile -or $Action -ne 'Play')){
     throw 'Use -CompareCopyOrder by itself on a gameplay run.'
 }
-$runtime=Join-Path $PSScriptRoot 'target\diag\victory.exe'
+$binaryProfile=if($Profile -or $CompareRefresh -or $CompareCopyOrder -or $Action -eq 'PrepareCache'){'diag'}else{'release'}
+$runtime=Join-Path $PSScriptRoot "target\$binaryProfile\victory.exe"
 if(-not (Test-Path -LiteralPath $runtime)){throw "Missing runtime: $runtime"}
 $exePath=(Resolve-Path -LiteralPath $Exe).Path
 $gameDir=Split-Path -Parent $exePath
@@ -61,7 +62,7 @@ if($Action -eq 'Play'){
     if($Profile){$settings.VICTORY_PROFILE="60,120,20,$logs\profile-$stamp.txt"}
 }
 foreach($key in $settings.Keys){Set-Item "Env:$key" $settings[$key]}
-Write-Host "VIctory: RTX 5070 Ti, 2560x1440, ray tracing=$RayTracing, profile=$Mode"
+Write-Host "VIctory: RTX 5070 Ti, 2560x1440, ray tracing=$RayTracing, profile=$Mode, executable=$binaryProfile"
 Write-Host "Cache: $env:VICTORY_CACHE_DIR"
 Write-Host "Log: $log"
 Write-Host 'Run from a normal, non-administrator terminal. Leave this window open.'

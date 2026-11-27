@@ -1,4 +1,4 @@
-VIctory 14900K / RTX 5070 Ti trial - revision 3
+VIctory 14900K / RTX 5070 Ti trial - revision 4
 
 Source: https://github.com/Belobug/VIctory-Belobug-AMD/tree/cd8dfc06ace7ccb91a19431e74bc2d0de2a10145
 License: GPL-3.0-or-later. Local modifications are supplied in fullscreen.patch.
@@ -9,6 +9,8 @@ VIctory is closed. Keep the target and scripts subfolders in place. Existing
 shader/pipeline caches and saves under AppData\Local\victory are reused.
 
 Launch-VIctory-1440p-RT.cmd:
+  Ordinary play uses the optimized release executable. Profiling, cache
+  preparation and both comparison options use the diagnostics executable.
   2560x1440 output, RTX 5070 Ti, ray tracing ON, borderless fullscreen with
   centered aspect-preserving presentation and black side bars on ultrawide.
   Uses the pinned fork's faster profile (THIN=1, JOIN_PARTS=8, UPLOAD_AHEAD=1).

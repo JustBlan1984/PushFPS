@@ -50,7 +50,7 @@ jobs:
       - name: Apply reviewed local presentation patch
         run: |
           $patch = "$env:GITHUB_WORKSPACE\build-scripts\victory-build\fullscreen.patch"
-          foreach ($file in @('crates/victory-gpu/Cargo.toml','crates/victory-gpu/src/host.rs','crates/victory-gpu/src/lib.rs','crates/victory-hle/src/modules/lifecycle.rs',$patch)) {
+          foreach ($file in @('crates/victory-gpu/Cargo.toml','crates/victory-gpu/src/host.rs','crates/victory-gpu/src/lib.rs','crates/victory-hle/src/modules/lifecycle.rs','crates/victory-gpu/src/host/card_steps.rs','crates/victory-gpu/src/descriptor.rs','crates/victory-gpu/src/land.rs',$patch)) {
             $absolute = (Resolve-Path -LiteralPath $file).Path
             $text = [IO.File]::ReadAllText($absolute).Replace("`r`n","`n")
             [IO.File]::WriteAllText($absolute,$text,[Text.UTF8Encoding]::new($false))
@@ -76,6 +76,12 @@ jobs:
         run: |
           cargo test --locked --profile diag -p victory-hle --lib fullscreen_americas_uses_one_top_level -- --ignored
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test GPU descriptor and readback ordering
+        run: |
+          cargo test --locked --profile diag -p victory-gpu --lib slot_partitions_preserve_descriptor_write_order
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --profile diag -p victory-gpu --lib ordered_pieces_hold_the_same_bytes
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Select an Intel hybrid CPU code-generation target
         run: |
           $targets = rustc --print target-cpus
@@ -91,11 +97,17 @@ jobs:
           cargo build --locked --profile diag -p victory --features diagnostics
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Test-Path 'C:\vt\diag\victory.exe')) { throw 'Compatibility executable missing' }
+      - name: Build release executable for normal gameplay
+        timeout-minutes: 60
+        run: |
+          cargo build --locked --release -p victory
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Package public compatibility layer only
         run: |
           $root = Join-Path $env:GITHUB_WORKSPACE 'dist\VIctory-14900K-5070Ti'
-          New-Item -ItemType Directory -Force "$root\target\diag","$root\scripts" | Out-Null
+          New-Item -ItemType Directory -Force "$root\target\diag","$root\target\release","$root\scripts" | Out-Null
           Copy-Item C:\vt\diag\victory.exe "$root\target\diag"
+          Copy-Item C:\vt\release\victory.exe "$root\target\release"
           Copy-Item scripts\play.ps1 "$root\scripts"
           Copy-Item LICENSE,Cargo.lock,rust-toolchain.toml,victory.example.toml $root
           Copy-Item "$env:GITHUB_WORKSPACE\build-scripts\victory-build\Start-VIctory-NVIDIA.ps1" $root
@@ -107,11 +119,12 @@ jobs:
             commit='cd8dfc06ace7ccb91a19431e74bc2d0de2a10145'
             cpuTarget=$env:VICTORY_CPU_TARGET
             gpuTarget='NVIDIA GeForce RTX 5070 Ti; runtime rendering performance unverified'
-            packageRevision='single-window-refresh-ab-v3'
+            packageRevision='release-batched-descriptors-v4'
             buildScriptsCommit=$env:GITHUB_SHA
             rust=(rustc --version)
             gameFilesIncluded=$false
-            sha256=(Get-FileHash "$root\target\diag\victory.exe").Hash
+            sha256=(Get-FileHash "$root\target\release\victory.exe").Hash
+            diagnosticSha256=(Get-FileHash "$root\target\diag\victory.exe").Hash
           } | ConvertTo-Json | Set-Content "$root\build-manifest.json" -Encoding utf8
           Compress-Archive "$root\*" "$root.zip"
           (Get-FileHash "$root.zip").Hash | Set-Content "$root.zip.sha256"
