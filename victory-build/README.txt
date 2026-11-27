@@ -19,6 +19,10 @@ Launch-VIctory-1440p-RT.cmd:
     .\Launch-VIctory-1440p-RT.cmd -CompareRefresh
   Play the same scene for at least two minutes. The log prints median and p90
   frame times for alternating 20-second phases with the guard off and on.
+  For the separate copy-order comparison use the same launcher:
+    .\Launch-VIctory-1440p-RT.cmd -CompareCopyOrder
+  This tests whether the submission can proceed when a conflicting copy comes
+  later in command order. Compare one switch at a time during a steady scene.
 
 Launch-VIctory-Safe-1440p-RT.cmd:
   Same output, ray tracing and fullscreen, with the earlier conservative

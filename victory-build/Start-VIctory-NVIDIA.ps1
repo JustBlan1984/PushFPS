@@ -6,9 +6,13 @@ param(
     [switch]$Windowed,
     [switch]$Profile,
     [switch]$CompareRefresh,
+    [switch]$CompareCopyOrder,
     [switch]$RayTracing=$true
 )
 $ErrorActionPreference='Stop'
+if($CompareCopyOrder -and ($CompareRefresh -or $Profile -or $Action -ne 'Play')){
+    throw 'Use -CompareCopyOrder by itself on a gameplay run.'
+}
 $runtime=Join-Path $PSScriptRoot 'target\diag\victory.exe'
 if(-not (Test-Path -LiteralPath $runtime)){throw "Missing runtime: $runtime"}
 $exePath=(Resolve-Path -LiteralPath $Exe).Path
@@ -46,6 +50,10 @@ if($Action -eq 'Play'){
     $settings.VICTORY_PIPELINE_BOOK='1'
     $settings.VICTORY_TIMER_LOG='1'
     $settings.VICTORY_MEMORY_CATEGORIES='1'
+    if($CompareCopyOrder){
+        $settings.VICTORY_AB='20,VICTORY_PLACED_ORDER'
+        Write-Host 'Copy-order comparison enabled. Hold the same view for two minutes in gameplay.'
+    }
     if($CompareRefresh){
         $settings.VICTORY_AB='20,VICTORY_PORT_GUARD'
         Write-Host 'Refresh comparison enabled. Keep the same gameplay scene for at least two minutes.'
