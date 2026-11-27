@@ -15,6 +15,12 @@ if($CompareCopyOrder -and ($CompareRefresh -or $Profile -or $Action -ne 'Play'))
 }
 $binaryProfile=if($Profile -or $CompareRefresh -or $CompareCopyOrder -or $Action -eq 'PrepareCache'){'diag'}else{'release'}
 $runtime=Join-Path $PSScriptRoot "target\$binaryProfile\victory.exe"
+# A launcher-only update can also run on the previous diagnostics-only package.
+if($binaryProfile -eq 'release' -and -not (Test-Path -LiteralPath $runtime)){
+    $binaryProfile='diag'
+    $runtime=Join-Path $PSScriptRoot 'target\diag\victory.exe'
+    Write-Host 'Using the installed diagnostics executable until the release package is installed.'
+}
 if(-not (Test-Path -LiteralPath $runtime)){throw "Missing runtime: $runtime"}
 $exePath=(Resolve-Path -LiteralPath $Exe).Path
 $gameDir=Split-Path -Parent $exePath
@@ -31,7 +37,7 @@ if(-not $env:VICTORY_DATA_DIR){$env:VICTORY_DATA_DIR=Join-Path $env:USERPROFILE 
 $preserve=@('VICTORY_CONFIG','VICTORY_GAME_DIR','VICTORY_CACHE_DIR','VICTORY_DATA_DIR','VICTORY_FIDELITYFX_DIR')
 Get-ChildItem Env:VICTORY_* | Where-Object {$_.Name -notin $preserve} | ForEach-Object {Remove-Item "Env:$($_.Name)"}
 $settings=@{
-    VICTORY_D3D12_ADAPTER='RTX 5070 Ti'; VICTORY_OUTPUT='2560x1440'
+    VICTORY_D3D12_ADAPTER='RTX 5070 Ti'; VICTORY_OUTPUT='1920x1080'
     VICTORY_WAVE_WIDE='0'; VICTORY_HOST_RDNA='0'
     VICTORY_FULLSCREEN=$(if($Windowed){'0'}else{'1'})
     VICTORY_TEXTURE_NO_WAIT='1'; VICTORY_RELAY='2'; VICTORY_WIDE_BACK='1'
@@ -67,7 +73,7 @@ if($Action -eq 'Play'){
     if($Profile){$settings.VICTORY_PROFILE="60,120,20,$logs\profile-$stamp.txt"}
 }
 foreach($key in $settings.Keys){Set-Item "Env:$key" $settings[$key]}
-Write-Host "VIctory: RTX 5070 Ti, 2560x1440, ray tracing=$RayTracing, profile=$Mode, executable=$binaryProfile"
+Write-Host "VIctory: RTX 5070 Ti, 1920x1080, ray tracing=$RayTracing, profile=$Mode, executable=$binaryProfile"
 Write-Host "Cache: $env:VICTORY_CACHE_DIR"
 Write-Host "Log: $log"
 Write-Host 'Run from a normal, non-administrator terminal. Leave this window open.'

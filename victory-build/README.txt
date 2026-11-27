@@ -11,7 +11,9 @@ shader/pipeline caches and saves under AppData\Local\victory are reused.
 Launch-VIctory-1440p-RT.cmd:
   Ordinary play uses the optimized release executable. Profiling, cache
   preparation and both comparison options use the diagnostics executable.
-  2560x1440 output, RTX 5070 Ti, ray tracing ON, borderless fullscreen with
+  The launcher filename is kept for existing shortcuts. On a 3440x1440
+  primary display the centered image fills 2560x1440 with 440-pixel side bars.
+  1920x1080 game output, RTX 5070 Ti, ray tracing ON, borderless fullscreen with
   centered aspect-preserving presentation and black side bars on ultrawide.
   Optimized play also requests the shared constants heap (renderer port 1)
   and GPU comparison of eligible buffers starting at 1 MiB, within the
