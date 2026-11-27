@@ -37,7 +37,9 @@ if(-not $env:VICTORY_DATA_DIR){$env:VICTORY_DATA_DIR=Join-Path $env:USERPROFILE 
 $preserve=@('VICTORY_CONFIG','VICTORY_GAME_DIR','VICTORY_CACHE_DIR','VICTORY_DATA_DIR','VICTORY_FIDELITYFX_DIR')
 Get-ChildItem Env:VICTORY_* | Where-Object {$_.Name -notin $preserve} | ForEach-Object {Remove-Item "Env:$($_.Name)"}
 $settings=@{
-    VICTORY_D3D12_ADAPTER='RTX 5070 Ti'; VICTORY_OUTPUT='1920x1080'
+    VICTORY_D3D12_ADAPTER='RTX 5070 Ti'
+    # Series X lays out its HUD on a 4K canvas. Scale the world independently.
+    VICTORY_OUTPUT='3840x2160'; VICTORY_RENDER_SCALE='0.5'
     VICTORY_WAVE_WIDE='0'; VICTORY_HOST_RDNA='0'
     VICTORY_FULLSCREEN=$(if($Windowed){'0'}else{'1'})
     VICTORY_TEXTURE_NO_WAIT='1'; VICTORY_RELAY='2'; VICTORY_WIDE_BACK='1'
@@ -73,7 +75,7 @@ if($Action -eq 'Play'){
     if($Profile){$settings.VICTORY_PROFILE="60,120,20,$logs\profile-$stamp.txt"}
 }
 foreach($key in $settings.Keys){Set-Item "Env:$key" $settings[$key]}
-Write-Host "VIctory: RTX 5070 Ti, 1920x1080, ray tracing=$RayTracing, profile=$Mode, executable=$binaryProfile"
+Write-Host "VIctory: RTX 5070 Ti, 1920x1080 scene, 3840x2160 menu canvas, ray tracing=$RayTracing, profile=$Mode, executable=$binaryProfile"
 Write-Host "Cache: $env:VICTORY_CACHE_DIR"
 Write-Host "Log: $log"
 Write-Host 'Run from a normal, non-administrator terminal. Leave this window open.'
